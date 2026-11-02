@@ -6,7 +6,9 @@ The protocol is implemented once, in C++17. `include/iya/oidc.hpp` is that imple
 
 JSON configuration keys match the Go library `oidc-caep-risc-go`. `signals` omitted or `true` keeps CAEP and RISC on. `signals: false` does not start the receiver, does not require transmitter metadata, and drops `ssf.read` and `ssf.manage` from the scope list after the default scopes are applied. The default scope string still names those two scopes. The shipped demo leaves `signals` on (the key is omitted). A value that is neither `true` nor `false` is refused. `pollIntervalMs` is a millisecond pause, not a port.
 
-The license is MIT. ## Using it from CMake
+The license is MIT.
+
+## Using it from CMake
 
 The build installs the library, its public headers and a CMake package. It builds static by
 default and shared with `-DBUILD_SHARED_LIBS=ON`; `-DIYA_OIDC_BUILD_TESTS=OFF -DIYA_OIDC_BUILD_PROGRAMS=OFF`
