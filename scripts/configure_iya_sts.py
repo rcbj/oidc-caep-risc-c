@@ -5,6 +5,10 @@
 The running container's PORT wins over the shell PORT. A loopback redirect follows that
 port. An explicit --public-url or PUBLIC_URL replaces the origin and keeps the path.
 The default http://localhost:3000 is not an explicit public URL.
+
+Every run writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the
+file tlsCa names (demo default generated/idp-ca.pem), through scripts/trust_chain.py. The demo image
+build copies that file in, so rebuild the image after running this against a different iya-sts.
 """
 
 import http.client
@@ -29,6 +33,7 @@ TIMEOUT_S = 15
 def _ssl_context(tls):
     tls = tls or {}
     context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     ca = tls.get("ca")
     if ca:
         context.load_verify_locations(cadata=ca)
@@ -471,6 +476,7 @@ def main(argv=None):
         print(f"  trust anchor {subject}")
         print(f"  sha256 {chain['fingerprint']}")
         print("  Compare the anchor with the Root CA on iya-sts's Server configuration, PKI page.")
+        print("  The demo image copies this file in when it is built: rebuild it (docker compose build).")
     admin_secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or ""
     if not admin_secret:
         raise RuntimeError("neither ADMIN_API_CLIENT_SECRET nor STS_ADMIN_API_CLIENT_SECRET is set, so no /admin-api token can be minted.")

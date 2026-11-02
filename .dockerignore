@@ -1,5 +1,6 @@
 .git
 build
 cmake-build-debug
-demo/generated
+demo/generated/*
+!demo/generated/idp-ca.pem
 __pycache__

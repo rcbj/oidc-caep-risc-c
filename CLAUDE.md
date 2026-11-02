@@ -17,9 +17,9 @@ Cryptography is OpenSSL from the Debian packages (`libssl` and `libcrypto`). HTT
 | `include/iya/oidc.hpp` | C++ classes. `FromFile`, `Authorize`, `Complete`. |
 | `include/iya_oidc.h` | The same operations as `extern "C"`. |
 | `src` | The only implementation. |
-| `tests` | `ctest`. A stub provider and a stub transmitter. No live iya-sts. |
+| `tests` | `ctest`. A stub provider and a stub transmitter. `tests/trust.c`: the `tlsCa` chain, a forged leaf, the host name, and `trust_chain.py`. No live iya-sts. |
 | `demo` | `demo/main.cpp` and `demo/public/`. Config is `demo/oidc.json`. |
-| `scripts` | `configure_iya_sts.py` registers the confidential client. `trust_chain.py` refreshes the listener CA file named by `tlsCa`. |
+| `scripts` | `configure_iya_sts.py` registers the confidential client and writes the listener CA chain named by `tlsCa`. `trust_chain.py` fetches and saves that chain. `live_iya_sts.py` is the live sign-in. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
 ## Usage
@@ -40,6 +40,16 @@ docker build --target test .
 
 The `test` stage is a sibling of the demo build. It runs `ctest` in Debian bookworm. GitHub Actions uses that command. Do not run the compiler or the library on the host. `docker build .` builds the demo and does not run the suite.
 
+## Live test and nightly
+
+`python3 scripts/live_iya_sts.py` (host stdlib python3 and Docker; never CMake or a compiler on the host) starts a fresh iya-sts `main` in memory mode as container `iya-sts-live-oidc-caep-risc-c` on `LIVE_STS_PORT` (default 18528), copies the checkout to a scratch build context, builds the demo image, runs `scripts/configure_iya_sts.py` on the host against that copy (which writes the trust chain), rebuilds the image (which bakes the chain in), checks the image's chain equals the saved one, runs `oidc-caep-risc-c-live-demo` with `--network host` on `LIVE_DEMO_PORT` (default 18628) mounting only `client-secret` and with `TLS_CA_REFRESH=0`, signs in through `/authn-api`, emits `credential-change` then `session-revoked`, and checks `GET /live-status`. `IYA_STS_URL` and `IYA_STS_IMAGE` select an existing iya-sts or image. It never binds 3000, 8081 or 18481-18495. Always against a fresh iya-sts. Secrets reach `docker run` as `-e NAME` and are never printed. `.github/workflows/nightly.yml` runs the unit image and the live script at 07:50 UTC (`50 7 * * *`).
+
+`/live-status` is `{signedIn, subject, receiver, events: [{type, jti}]}`, never tokens. A `session-revoked` that matched no tracked session ends the demo's one local session (`RememberLiveEvent` in `demo/main.cpp`, not the library).
+
+## tlsCa, the iya-sts trust chain
+
+`tlsCa` (demo default `generated/idp-ca.pem`) is iya-sts's listener CA trust chain. `scripts/configure_iya_sts.py` writes the whole chain on every run via `scripts/trust_chain.py` (`GET /tls/server-certificate`, falling back to the handshake) and prints the path, anchor subject and SHA-256. `src/http.cpp` loads every PEM block as an anchor (and, with `tlsCa` set, no system roots) and verifies the host name (`SSL_set1_host`, or `X509_VERIFY_PARAM_set1_ip_asc` for an IP literal, which gets no SNI). There is no pinned shortcut: a forged leaf followed by the real CA certificates fails verification. The test and build stages copy only `CMakeLists.txt`, `VERSION`, `include`, `src`, `tests`, `scripts` and `demo/main.cpp`; the demo stage then does `COPY demo demo`, and `.dockerignore` excludes `demo/generated/*` except `idp-ca.pem`, so the image carries the chain and no secret, and a build without it still succeeds. Rebuild the demo image after re-running the install script against a different iya-sts. `demo/entrypoint.sh` still refreshes the chain at start unless `TLS_CA_REFRESH=0`.
+
 ## Demo
 
 `docker-compose.yml` sets `network_mode: host`. The process binds `PORT`, default 3000. `ENV PORT=3000` in the image keeps an unset value on 3000, and the health check calls `http://127.0.0.1:${PORT}/healthz`.
@@ -48,7 +58,7 @@ The `test` stage is a sibling of the demo build. It runs `ctest` in Debian bookw
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. The signals receiver runs when `signals` is not false.
+`GET /healthz` returns `ok`. `GET /live-status` is the JSON above. `GET /` is the page. `GET /login` redirects to the provider. `GET /callback` completes the sign-in. `POST /logout` ends the local session. The signals receiver runs when `signals` is not false.
 
 A loopback redirect follows `PORT` in the running server and in `scripts/configure_iya_sts.py`. Any other host is left as written. An explicit `--public-url` or a non-empty `PUBLIC_URL` replaces the origin and keeps the path. The running container's `PORT` wins over the shell's when the script registers the application.
 

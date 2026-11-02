@@ -6,6 +6,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -192,9 +193,17 @@ int ConnectTo(const std::string &host, const std::string &port, const std::strin
   return fd;
 }
 
+// tlsCa is iya-sts's listener CA trust chain: leaf, TLS Issuing CA, Intermediate
+// and Root. Every PEM block goes into the store, so the path the server presents
+// ends at the self-signed Root. A certificate in the store is trusted only as an
+// anchor the presented chain verifies to (or as that exact leaf); a forged leaf
+// followed by the real, public CA certificates does not verify and is refused.
+// With tlsCa set, the system roots are not added: the file is the trust store.
 void ApplyCA(SSL_CTX *ctx, const std::string &ca, const std::string &code) {
-  SSL_CTX_set_default_verify_paths(ctx);
-  if (ca.empty()) return;
+  if (ca.empty()) {
+    SSL_CTX_set_default_verify_paths(ctx);
+    return;
+  }
   BIO *bio = BIO_new_mem_buf(ca.data(), static_cast<int>(ca.size()));
   if (!bio) throw OidcError(code, "the configured tlsCa is not a PEM trust anchor");
   X509_STORE *store = SSL_CTX_get_cert_store(ctx);
@@ -361,8 +370,17 @@ HttpResult Send(const std::string &url, const std::string &method,
     }
     conn.ssl = SSL_new(conn.ctx);
     SSL_set_fd(conn.ssl, conn.fd);
-    if (!IsIP(u.host)) SSL_set_tlsext_host_name(conn.ssl, u.host.c_str());
-    SSL_set1_host(conn.ssl, u.host.c_str());
+    // The certificate must name the host the URL names: a DNS name against a DNS
+    // SAN, an IP literal against an IP SAN. A chain to a trusted root is not enough
+    // on its own. RFC 6066 sends no server name for an IP literal.
+    bool named = false;
+    if (IsIP(u.host)) {
+      named = X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(conn.ssl), u.host.c_str()) == 1;
+    } else {
+      SSL_set_hostflags(conn.ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      named = SSL_set1_host(conn.ssl, u.host.c_str()) == 1 && SSL_set_tlsext_host_name(conn.ssl, u.host.c_str()) == 1;
+    }
+    if (!named) throw OidcError(code, url + ": cannot check the host name " + u.host);
     if (SSL_connect(conn.ssl) != 1) throw OidcError(code, url + ": tls handshake failed");
   }
   std::string path = u.path.empty() ? "/" : u.path;
