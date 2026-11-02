@@ -6,7 +6,22 @@ The protocol is implemented once, in C++17. `include/iya/oidc.hpp` is that imple
 
 JSON configuration keys match the Go library `oidc-caep-risc-go`. `signals` omitted or `true` keeps CAEP and RISC on. `signals: false` does not start the receiver, does not require transmitter metadata, and drops `ssf.read` and `ssf.manage` from the scope list after the default scopes are applied. The default scope string still names those two scopes. The shipped demo leaves `signals` on (the key is omitted). A value that is neither `true` nor `false` is refused. `pollIntervalMs` is a millisecond pause, not a port.
 
-The license is MIT. Publishing is not set up.
+The license is MIT. ## Using it from CMake
+
+The build installs the library, its public headers and a CMake package. It builds static by
+default and shared with `-DBUILD_SHARED_LIBS=ON`; `-DIYA_OIDC_BUILD_TESTS=OFF -DIYA_OIDC_BUILD_PROGRAMS=OFF`
+builds the library alone (both are on only when this is the top-level project). Then:
+
+```cmake
+find_package(iya_oidc REQUIRED)
+target_link_libraries(app PRIVATE iya::oidc)
+```
+
+The package finds the library's own dependencies, and the target carries the include
+directory and C++17. The Docker test stage checks this: it installs the static and the shared
+library and builds the C++ smoke test against each through `find_package` (`tests/package/`).
+
+A pull request merged into `main` releases the library after the test workflow succeeds on that commit: `release.yml` tags `v<VERSION>` and makes a GitHub Release, whose source archive is what a package recipe (such as a ConanCenter one) builds from. A direct push does not release. A tag that already exists stays; the next release is a new version in `VERSION`, which the CMake project, the package and the tag all read.
 
 ## Usage
 
