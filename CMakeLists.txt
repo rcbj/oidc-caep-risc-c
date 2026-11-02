@@ -37,6 +37,10 @@ add_executable(oidc_tests
 target_include_directories(oidc_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(oidc_tests PRIVATE iya_oidc)
 
+add_executable(oidc_trust_tests tests/trust.c)
+target_include_directories(oidc_trust_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(oidc_trust_tests PRIVATE iya_oidc OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
 add_executable(oidc_cpp_smoke tests/cpp_smoke.cpp)
 target_link_libraries(oidc_cpp_smoke PRIVATE iya_oidc)
 
@@ -59,5 +63,15 @@ set(IYA_TESTS
 )
 foreach(name ${IYA_TESTS})
   add_test(NAME ${name} COMMAND oidc_tests ${name})
+endforeach()
+set(IYA_TRUST_TESTS
+  TestTlsCaChainIsTheTrustStore
+  TestAForgedLeafBeforeTheRealCaIsRefused
+  TestHostNameIsChecked
+  TestConfigureWritesTheWholeChain
+)
+foreach(name ${IYA_TRUST_TESTS})
+  add_test(NAME ${name} COMMAND oidc_trust_tests ${name})
+  set_tests_properties(${name} PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} TIMEOUT 180)
 endforeach()
 add_test(NAME CppSmoke COMMAND oidc_cpp_smoke)

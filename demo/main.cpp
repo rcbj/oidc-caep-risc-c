@@ -43,6 +43,14 @@ struct Session {
   double expires = 0;
 };
 
+// One accepted Shared Signals event, for GET /live-status. Never a token.
+struct LiveEvent {
+  std::string type;
+  std::string jti;
+};
+
+const char *kSessionRevoked = "https://schemas.openid.net/secevent/caep/event-type/session-revoked";
+
 struct Req {
   std::string method;
   std::string path;
@@ -287,6 +295,7 @@ struct App {
   bool loaded = false;
   std::string receiver_state;
   std::unique_ptr<iya::SignalsReceiver> receiver;
+  std::vector<LiveEvent> events;
 
   std::string Mac(const std::string &value) const {
     unsigned char md[EVP_MAX_MD_SIZE];
@@ -407,6 +416,7 @@ struct App {
             for (const auto &id : ids) sessions.erase(id);
           },
           opts);
+      receiver->On("*", [this](const iya::SignalEvent &event) { RememberLiveEvent(event); });
       receiver->Start();
       receiver_state = "polling stream " + receiver->stream_id() + " at " + party->ssf_transmitter();
     } catch (const std::exception &e) {
@@ -414,6 +424,48 @@ struct App {
       receiver_state = std::string("not running: ") + e.what();
       std::fprintf(stderr, "ssf: the receiver did not start: %s\n", e.what());
     }
+  }
+
+  // Records an accepted event for /live-status. The receiver ends a session only
+  // when the event names one it tracks. A session-revoked that matched none
+  // leaves this demo's one login in place, so the demo (not the library) ends
+  // that one local session and untracks it.
+  void RememberLiveEvent(const iya::SignalEvent &event) {
+    std::lock_guard<std::mutex> lock(mu);
+    events.push_back(LiveEvent{event.type, event.jti});
+    if (event.type != kSessionRevoked || !event.sessions.empty() || sessions.size() != 1) return;
+    std::string sid = sessions.begin()->first;
+    sessions.clear();
+    if (receiver) receiver->Untrack(sid);
+  }
+
+  // {signedIn, subject, receiver, events: [{type, jti}]} for scripts/live_iya_sts.py.
+  // It never includes a token or an ID Token claim set.
+  void LiveStatus(int fd, const Req &req) {
+    Session sess;
+    std::string sid = SessionOf(req, &sess);
+    iya::J doc = iya::J::obj();
+    doc.set("signedIn", iya::J::boolean(!sid.empty()));
+    std::string who;
+    if (!sid.empty()) {
+      who = sess.login.preferred_username;
+      if (who.empty()) who = sess.login.email;
+      if (who.empty()) who = sess.login.subject;
+    }
+    doc.set("subject", who.empty() ? iya::J() : iya::J::str(who));
+    iya::J list = iya::J::arr();
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      doc.set("receiver", iya::J::str(receiver_state));
+      for (const auto &one : events) {
+        iya::J item = iya::J::obj();
+        item.set("type", iya::J::str(one.type));
+        item.set("jti", one.jti.empty() ? iya::J() : iya::J::str(one.jti));
+        list.a.push_back(item);
+      }
+    }
+    doc.set("events", list);
+    Send(fd, 200, iya::Stringify(doc), "application/json", {});
   }
 
   iya::RelyingParty *Relying() {
@@ -590,6 +642,10 @@ struct App {
     try {
       if (req.path == "/healthz") {
         Send(fd, 200, "ok", "text/plain", {});
+        return;
+      }
+      if (req.path == "/live-status" && req.method == "GET") {
+        LiveStatus(fd, req);
         return;
       }
       if (req.path == "/styles.css" && req.method == "GET") {

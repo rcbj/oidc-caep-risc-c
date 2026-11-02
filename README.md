@@ -58,7 +58,7 @@ Tokens stay in this process. Keep the transaction until the browser returns. A c
 | `metadataFile` | Provider metadata already on disk. |
 | `privateKey` | PEM for `private_key_jwt`, as a literal, `env:NAME`, `file:path`, or a path. |
 | `privateKeyAlg` | Defaults to `RS256`. |
-| `tlsCa` | PEM trust anchor, inline, `file:`, `env:`, or a path. A missing file or an empty env var omits the key. |
+| `tlsCa` | The provider's TLS listener CA trust chain: PEM, inline, `file:`, `env:`, or a path (demo: `generated/idp-ca.pem`). Every certificate in it is a trust anchor, and the system roots are not added. A missing file or an empty env var omits the key, and the system roots are used. |
 | `par` | `auto` (default), `always`, or `never`. |
 | `idTokenSignedResponseAlg` | Pins the ID token algorithm when set. |
 | `clockToleranceSec` | Defaults to 30. |
@@ -73,7 +73,27 @@ Tokens stay in this process. Keep the transaction until the browser returns. A c
 docker build --target test .
 ```
 
-The `test` stage builds the library and runs `ctest` in Debian bookworm. GitHub Actions uses that command. The demo image does not run the suite. The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts.
+The `test` stage builds the library and runs `ctest` in Debian bookworm. GitHub Actions uses that command. The demo image does not run the suite. The tests build an in-process stub provider and a stub transmitter. They do not need a live iya-sts. `tests/trust.c` serves HTTPS from a four-certificate chain shaped like iya-sts's and checks that the whole `tlsCa` chain file is the trust store (the leaf alone or another root is refused), that a forged leaf followed by the real CA certificates is refused, that the host name is verified (right chain, wrong name refused; a DNS name and `127.0.0.1` via an IP SAN accepted), and that `scripts/trust_chain.py` writes the whole chain from `GET /tls/server-certificate` and from the handshake.
+
+## Live iya-sts test and the nightly suite
+
+```bash
+python3 scripts/live_iya_sts.py
+```
+
+The script starts the latest `main` of iya-sts in a container (memory mode, no persistence, no clustering), registers the demo with it, signs in through the demo, emits CAEP `credential-change` and then `session-revoked`, and requires the demo's `GET /live-status` to show both, the second one with the local session ended. It prints JSON ending in `"ok": true`. `IYA_STS_URL` uses an iya-sts that is already running (and does not stop it), `IYA_STS_IMAGE` starts a fresh container from that image, and otherwise iya-sts `main` is cloned and built. `LIVE_STS_PORT` (default 18528) and `LIVE_DEMO_PORT` (default 18628) are the host ports; 3000, 8081 and 18481-18495 are refused. Always use a fresh iya-sts: a second run against an already-registered client is not supported. The library and the demo build and run only in containers; the script needs the host's `python3` (standard library) and Docker.
+
+`GET /live-status` answers `{"signedIn", "subject", "receiver", "events": [{"type", "jti"}]}` and never a token. When a `session-revoked` event matches no tracked session, the demo ends its one local session and untracks it.
+
+`.github/workflows/nightly.yml` runs the unit suite and the live script every day at 07:50 UTC (`50 7 * * *`), and on demand. Push and pull-request CI stays in `tests.yml`.
+
+## The iya-sts trust chain (`tlsCa`)
+
+`tlsCa` (demo default `generated/idp-ca.pem`, relative to `demo/`) is iya-sts's TLS listener CA trust chain. `scripts/configure_iya_sts.py` writes it on every run through `scripts/trust_chain.py`: the whole chain iya-sts publishes at `GET /tls/server-certificate` (leaf, TLS Issuing CA, Intermediate, Root), or the chain presented in the TLS handshake when that is missing. It prints the path, the anchor's subject and its SHA-256.
+
+The library loads every PEM block of `tlsCa` into its OpenSSL trust store, so the presented path ends at the self-signed Root, and it verifies that the listener's certificate names the host in the URL: a DNS name against a DNS SAN, an IP literal (such as `127.0.0.1`) against an IP SAN. A certificate that chains to the trusted root but does not name the host is refused, and so is a forged leaf sent ahead of the real CA certificates.
+
+The demo image build copies `demo/` after compiling, and `.dockerignore` admits only `demo/generated/idp-ca.pem` from `demo/generated`, so the image carries the chain at `/app/demo/generated/idp-ca.pem` with no bind mount. The client secret stays out of the image. A build before the install script has run still succeeds; the image then has no chain. Rebuild the image after re-running the install script against a different iya-sts. The entrypoint also refreshes the chain at start unless `TLS_CA_REFRESH=0`.
 
 ## Layout
 
@@ -84,7 +104,9 @@ The `test` stage builds the library and runs `ctest` in Debian bookworm. GitHub 
 | `src` | The only implementation. JSON, HTTP/1.1, and OpenSSL. |
 | `tests` | C tests of the relying party and Shared Signals cases, plus one C++ smoke test. Both link `iya_oidc`. |
 | `demo` | `demo/main.cpp` and `demo/public/`. Config is `demo/oidc.json`. |
-| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/configure_iya_sts.py` | Registers the confidential client on iya-sts and writes the listener CA trust chain where `tlsCa` names it. Loopback redirects follow the running container's `PORT`, then the shell `PORT`. |
+| `scripts/trust_chain.py` | Fetches and saves that chain. |
+| `scripts/live_iya_sts.py` | The live sign-in against a fresh iya-sts. |
 | `Dockerfile`, `docker-compose.yml` | The demo image. Compose uses host networking. |
 
 ## Demo
@@ -95,7 +117,7 @@ The `test` stage builds the library and runs `ctest` in Debian bookworm. GitHub 
 docker compose up --build
 ```
 
-`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts the code flow and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. The signals receiver runs when `signals` is not `false`.
+`GET /healthz` returns `ok`. `GET /` is the page. `GET /login` starts the code flow and redirects. `GET /callback` completes the code exchange. `POST /logout` signs the local session out. `GET /live-status` reports the sign-in and the accepted Shared Signals events as JSON, without tokens. The signals receiver runs when `signals` is not `false`.
 
 `docker-compose.yml` sets `network_mode: host` and does not publish a host port. The image sets `ENV PORT=3000`. The health check calls `http://127.0.0.1:${PORT}/healthz`. The running container's `PORT` wins over the shell's when the registrar runs.
 
@@ -104,5 +126,7 @@ Register the client with:
 ```sh
 python scripts/configure_iya_sts.py --config demo/oidc.json
 ```
+
+It also writes the trust chain to `demo/generated/idp-ca.pem`; rebuild the demo image afterwards (`docker compose build`).
 
 Open `http://127.0.0.1:$PORT` after the provider is up. Do not bind port 3000 while another demo is already using it.
