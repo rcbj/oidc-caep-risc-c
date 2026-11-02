@@ -6,7 +6,7 @@ The protocol is implemented once, in C++17, in `src/`. `include/iya/oidc.hpp` is
 
 `signals` defaults to on. `signals: false` turns CAEP and RISC off: the receiver does not start, transmitter metadata is not required, and the authorization request does not include `ssf.read` or `ssf.manage`. The default scope string still names those two scopes. They are removed after that default is applied. A value that is neither true nor false is refused. The shipped demo omits `signals`, so they stay on. `pollIntervalMs` is a millisecond pause, not a port.
 
-The license is the MIT License in `LICENSE`. Publishing is not set up. `develop` and `main` are the branches the test workflow runs.
+The license is the MIT License in `LICENSE`. The library is a CMake package: `find_package(iya_oidc)` gives `iya::oidc`; static by default, shared with `BUILD_SHARED_LIBS`; `IYA_OIDC_BUILD_TESTS` and `IYA_OIDC_BUILD_PROGRAMS` default on only at the top level. `tests/package/check.sh` (run by the Docker test stage) installs both variants and builds the smoke test against each. A pull request merged into `main` releases the library after the test workflow succeeds on that commit: `release.yml` tags `v<VERSION>` and makes a GitHub Release, whose source archive is what a package recipe (such as a ConanCenter one) builds from. A direct push does not release. A tag that already exists stays; the next release is a new version in `VERSION`, which the CMake project, the package and the tag all read. `develop` and `main` are the branches the test workflow runs.
 
 Cryptography is OpenSSL from the Debian packages (`libssl` and `libcrypto`). HTTP/1.1 and JSON are in this repository. No curl, no JSON library, no OAuth library, and no Boost.
 
