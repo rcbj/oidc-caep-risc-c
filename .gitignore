@@ -1,0 +1,7 @@
+build/
+cmake-build-*/
+demo/generated/
+venv/
+.venv/
+__pycache__/
+*.pyc
