@@ -6,7 +6,22 @@ The protocol is implemented once, in C++17. `include/iya/oidc.hpp` is that imple
 
 JSON configuration keys match the Go library `oidc-caep-risc-go`. `signals` omitted or `true` keeps CAEP and RISC on. `signals: false` does not start the receiver, does not require transmitter metadata, and drops `ssf.read` and `ssf.manage` from the scope list after the default scopes are applied. The default scope string still names those two scopes. The shipped demo leaves `signals` on (the key is omitted). A value that is neither `true` nor `false` is refused. `pollIntervalMs` is a millisecond pause, not a port.
 
-The license is MIT. Publishing is not set up.
+The license is MIT. ## Using it from CMake
+
+The build installs the library, its public headers and a CMake package. It builds static by
+default and shared with `-DBUILD_SHARED_LIBS=ON`; `-DIYA_OIDC_BUILD_TESTS=OFF -DIYA_OIDC_BUILD_PROGRAMS=OFF`
+builds the library alone (both are on only when this is the top-level project). Then:
+
+```cmake
+find_package(iya_oidc REQUIRED)
+target_link_libraries(app PRIVATE iya::oidc)
+```
+
+The package finds the library's own dependencies, and the target carries the include
+directory and C++17. The Docker test stage checks this: it installs the static and the shared
+library and builds the C++ smoke test against each through `find_package` (`tests/package/`).
+
+A pull request merged into `main` releases the library after the test workflow succeeds on that commit: `release.yml` tags `v<VERSION>` and makes a GitHub Release, whose source archive is what a package recipe (such as a ConanCenter one) builds from. A direct push does not release. A tag that already exists stays; the next release is a new version in `VERSION`, which the CMake project, the package and the tag all read.
 
 ## Usage
 
@@ -90,6 +105,8 @@ The script starts the latest `main` of iya-sts in a container (memory mode, no p
 ## The iya-sts trust chain (`tlsCa`)
 
 `tlsCa` (demo default `generated/idp-ca.pem`, relative to `demo/`) is iya-sts's TLS listener CA trust chain. `scripts/configure_iya_sts.py` writes it on every run through `scripts/trust_chain.py`: the whole chain iya-sts publishes at `GET /tls/server-certificate` (leaf, TLS Issuing CA, Intermediate, Root), or the chain presented in the TLS handshake when that is missing. It prints the path, the anchor's subject and its SHA-256.
+
+The install script never prints a generated test-user password or the client secret: a generated password goes to `demo/generated/<user>.password` and the client secret to the file `secretFile` names, each created mode 0600, and only the password file's path is printed; `--dry-run`'s plan never holds the client secret. No line it or the live script prints carries anything derived from a password or secret.
 
 The library loads every PEM block of `tlsCa` into its OpenSSL trust store, so the presented path ends at the self-signed Root, and it verifies that the listener's certificate names the host in the URL: a DNS name against a DNS SAN, an IP literal (such as `127.0.0.1`) against an IP SAN. A certificate that chains to the trusted root but does not name the host is refused, and so is a forged leaf sent ahead of the real CA certificates.
 

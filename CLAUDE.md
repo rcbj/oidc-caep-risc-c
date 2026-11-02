@@ -6,7 +6,7 @@ The protocol is implemented once, in C++17, in `src/`. `include/iya/oidc.hpp` is
 
 `signals` defaults to on. `signals: false` turns CAEP and RISC off: the receiver does not start, transmitter metadata is not required, and the authorization request does not include `ssf.read` or `ssf.manage`. The default scope string still names those two scopes. They are removed after that default is applied. A value that is neither true nor false is refused. The shipped demo omits `signals`, so they stay on. `pollIntervalMs` is a millisecond pause, not a port.
 
-The license is the MIT License in `LICENSE`. Publishing is not set up. `develop` and `main` are the branches the test workflow runs.
+The license is the MIT License in `LICENSE`. The library is a CMake package: `find_package(iya_oidc)` gives `iya::oidc`; static by default, shared with `BUILD_SHARED_LIBS`; `IYA_OIDC_BUILD_TESTS` and `IYA_OIDC_BUILD_PROGRAMS` default on only at the top level. `tests/package/check.sh` (run by the Docker test stage) installs both variants and builds the smoke test against each. A pull request merged into `main` releases the library after the test workflow succeeds on that commit: `release.yml` tags `v<VERSION>` and makes a GitHub Release, whose source archive is what a package recipe (such as a ConanCenter one) builds from. A direct push does not release. A tag that already exists stays; the next release is a new version in `VERSION`, which the CMake project, the package and the tag all read. `develop` and `main` are the branches the test workflow runs.
 
 Cryptography is OpenSSL from the Debian packages (`libssl` and `libcrypto`). HTTP/1.1 and JSON are in this repository. No curl, no JSON library, no OAuth library, and no Boost.
 
@@ -49,6 +49,8 @@ The `test` stage is a sibling of the demo build. It runs `ctest` in Debian bookw
 ## tlsCa, the iya-sts trust chain
 
 `tlsCa` (demo default `generated/idp-ca.pem`) is iya-sts's listener CA trust chain. `scripts/configure_iya_sts.py` writes the whole chain on every run via `scripts/trust_chain.py` (`GET /tls/server-certificate`, falling back to the handshake) and prints the path, anchor subject and SHA-256. `src/http.cpp` loads every PEM block as an anchor (and, with `tlsCa` set, no system roots) and verifies the host name (`SSL_set1_host`, or `X509_VERIFY_PARAM_set1_ip_asc` for an IP literal, which gets no SNI). There is no pinned shortcut: a forged leaf followed by the real CA certificates fails verification. The test and build stages copy only `CMakeLists.txt`, `VERSION`, `include`, `src`, `tests`, `scripts` and `demo/main.cpp`; the demo stage then does `COPY demo demo`, and `.dockerignore` excludes `demo/generated/*` except `idp-ca.pem`, so the image carries the chain and no secret, and a build without it still succeeds. Rebuild the demo image after re-running the install script against a different iya-sts. `demo/entrypoint.sh` still refreshes the chain at start unless `TLS_CA_REFRESH=0`.
+
+The install script never prints a generated test-user password or the client secret: a generated password goes to `demo/generated/<user>.password` and the client secret to the file `secretFile` names, each created mode 0600, and only the password file's path is printed; `--dry-run`'s plan never holds the client secret. No line it or the live script prints carries anything derived from a password or secret.
 
 ## Demo
 
