@@ -19,6 +19,16 @@ int TestVerifiesASETAgainstTheJWKS(void);
 int TestReadsSubjectForms(void);
 int TestPollsAndEndsOnlyTheNamedSession(void);
 int TestOidcErrorIsExported(void);
+int TestDPoPProofsOnEveryRequest(void);
+int TestDPoPModes(void);
+int TestDPoPNonceAndTransmitterCalls(void);
+int TestTokenTypeMustMatchTheProof(void);
+int TestAcrIsEnforced(void);
+int TestPARRequiredByTheProvider(void);
+int TestIdTokenAlgorithms(void);
+int TestTypAndAtHashAreRequired(void);
+int TestCreateAppliesTheSameRules(void);
+int TestSessionTokenCache(void);
 
 int main(int argc, char **argv) {
   struct {
@@ -39,6 +49,16 @@ int main(int argc, char **argv) {
       {"TestReadsSubjectForms", TestReadsSubjectForms},
       {"TestPollsAndEndsOnlyTheNamedSession", TestPollsAndEndsOnlyTheNamedSession},
       {"TestOidcErrorIsExported", TestOidcErrorIsExported},
+      {"TestDPoPProofsOnEveryRequest", TestDPoPProofsOnEveryRequest},
+      {"TestDPoPModes", TestDPoPModes},
+      {"TestDPoPNonceAndTransmitterCalls", TestDPoPNonceAndTransmitterCalls},
+      {"TestTokenTypeMustMatchTheProof", TestTokenTypeMustMatchTheProof},
+      {"TestAcrIsEnforced", TestAcrIsEnforced},
+      {"TestPARRequiredByTheProvider", TestPARRequiredByTheProvider},
+      {"TestIdTokenAlgorithms", TestIdTokenAlgorithms},
+      {"TestTypAndAtHashAreRequired", TestTypAndAtHashAreRequired},
+      {"TestCreateAppliesTheSameRules", TestCreateAppliesTheSameRules},
+      {"TestSessionTokenCache", TestSessionTokenCache},
   };
   if (argc != 2) {
     fprintf(stderr, "usage: oidc_tests <TestName>\n");

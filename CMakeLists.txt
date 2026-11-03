@@ -106,6 +106,16 @@ set(IYA_TESTS
   TestReadsSubjectForms
   TestPollsAndEndsOnlyTheNamedSession
   TestOidcErrorIsExported
+  TestDPoPProofsOnEveryRequest
+  TestDPoPModes
+  TestDPoPNonceAndTransmitterCalls
+  TestTokenTypeMustMatchTheProof
+  TestAcrIsEnforced
+  TestPARRequiredByTheProvider
+  TestIdTokenAlgorithms
+  TestTypAndAtHashAreRequired
+  TestCreateAppliesTheSameRules
+  TestSessionTokenCache
 )
 foreach(name ${IYA_TESTS})
   add_test(NAME ${name} COMMAND oidc_tests ${name})

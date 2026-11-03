@@ -440,6 +440,8 @@ struct SignalsReceiver::Impl : std::enable_shared_from_this<Impl> {
   std::string transmitter;
   std::function<void(const std::vector<std::string> &, const SignalEvent &)> on_end;
   std::function<std::map<std::string, std::string>()> headers;
+  std::function<std::map<std::string, std::string>(const std::string &, const std::string &)> request_headers;
+  std::function<bool(const std::string &, int, const std::string &, const std::string &)> on_response;
   std::vector<std::string> events_requested;
   std::vector<std::string> end_on;
   std::string description;
@@ -464,20 +466,32 @@ struct SignalsReceiver::Impl : std::enable_shared_from_this<Impl> {
   std::map<std::string, std::vector<std::function<void(const SignalEvent &)>>> handlers;
   std::shared_ptr<Flight> inflight;
 
+  // One transmitter call. request_headers is asked again for each attempt, so a
+  // DPoP proof is fresh and carries the nonce the transmitter last gave; on_response
+  // decides whether a challenge is answered with one more attempt.
   Answer Call(const std::string &method, const std::string &url, const J *body) {
-    std::vector<std::pair<std::string, std::string>> hdrs = {{"accept", "application/json"}};
-    if (headers) {
-      auto extra = headers();
-      for (const auto &kv : extra) hdrs.emplace_back(kv.first, kv.second);
-    }
     std::string payload;
     const std::string *sent = nullptr;
     if (body) {
       payload = Stringify(*body);
       sent = &payload;
-      hdrs.emplace_back("content-type", "application/json");
     }
-    HttpResult res = Send(url, method, hdrs, sent, tls_ca, "ssf");
+    HttpResult res;
+    for (int attempt = 0;; attempt++) {
+      std::vector<std::pair<std::string, std::string>> hdrs = {{"accept", "application/json"}};
+      if (headers) {
+        auto extra = headers();
+        for (const auto &kv : extra) hdrs.emplace_back(kv.first, kv.second);
+      }
+      if (request_headers) {
+        auto extra = request_headers(method, url);
+        for (const auto &kv : extra) hdrs.emplace_back(kv.first, kv.second);
+      }
+      if (body) hdrs.emplace_back("content-type", "application/json");
+      res = Send(url, method, hdrs, sent, tls_ca, "ssf");
+      bool again = on_response && on_response(url, res.status, res.header("WWW-Authenticate"), res.header("DPoP-Nonce"));
+      if (!again || attempt > 0) break;
+    }
     Answer out;
     out.status = res.status;
     out.raw = res.body;
@@ -838,6 +852,8 @@ std::unique_ptr<SignalsReceiver> SignalsReceiver::New(
   impl->transmitter = TrimRightSlash(transmitter);
   impl->on_end = std::move(on_end);
   impl->headers = std::move(opts.headers);
+  impl->request_headers = std::move(opts.request_headers);
+  impl->on_response = std::move(opts.on_response);
   impl->events_requested = opts.events_requested.empty() ? DefaultRequested() : opts.events_requested;
   impl->end_on = opts.end_on.empty() ? DefaultEnding() : opts.end_on;
   impl->description = opts.description;
