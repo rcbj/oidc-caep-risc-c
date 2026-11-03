@@ -49,6 +49,12 @@ std::string CurveName(const std::string &alg) {
   return "P-256";
 }
 
+std::string OpenSSLCurve(const std::string &alg) {
+  if (alg == "ES384") return "secp384r1";
+  if (alg == "ES512") return "secp521r1";
+  return "prime256v1";
+}
+
 std::string OsslText() {
   char buf[256];
   unsigned long e = ERR_get_error();
@@ -156,7 +162,9 @@ EVP_PKEY *LoadPrivateKey(const std::string &pem, const std::string &alg) {
       char curve[64];
       size_t clen = 0;
       if (EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME, curve, sizeof curve, &clen) == 1) {
-        match = CurveName(alg) == curve;
+        // OpenSSL names the curves prime256v1, secp384r1 and secp521r1.
+        std::string got = curve;
+        match = CurveName(alg) == got || OpenSSLCurve(alg) == got;
       }
     }
   }
@@ -172,7 +180,8 @@ EVP_PKEY *LoadPrivateKey(const std::string &pem, const std::string &alg) {
 std::vector<uint8_t> SignJWS(EVP_PKEY *key, const std::string &alg, const uint8_t *input, size_t len) {
   const AlgSpec *spec = LookupAlg(alg);
   if (!spec || !key) throw OidcError("protocol", "the client assertion could not be signed: unsupported algorithm");
-  if (std::strcmp(spec->mode, "pkcs1") != 0 && std::strcmp(spec->mode, "pss") != 0) {
+  bool ecdsa = std::strcmp(spec->mode, "p1363") == 0;
+  if (std::strcmp(spec->mode, "pkcs1") != 0 && std::strcmp(spec->mode, "pss") != 0 && !ecdsa) {
     throw OidcError("protocol", "the client assertion could not be signed: unsupported algorithm");
   }
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
@@ -191,6 +200,21 @@ std::vector<uint8_t> SignJWS(EVP_PKEY *key, const std::string &alg, const uint8_
     sig.resize(siglen);
     if (EVP_DigestSignFinal(ctx, sig.data(), &siglen) != 1) throw std::runtime_error(OsslText());
     sig.resize(siglen);
+    if (ecdsa) {
+      // OpenSSL signs ECDSA as DER; a JWS carries r and s, each padded to the curve size.
+      const unsigned char *p = sig.data();
+      ECDSA_SIG *es = d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(sig.size()));
+      if (!es) throw std::runtime_error(OsslText());
+      const BIGNUM *r = nullptr;
+      const BIGNUM *s = nullptr;
+      ECDSA_SIG_get0(es, &r, &s);
+      int size = CurveSize(alg);
+      std::vector<uint8_t> raw(static_cast<size_t>(size * 2));
+      bool ok = BN_bn2binpad(r, raw.data(), size) == size && BN_bn2binpad(s, raw.data() + size, size) == size;
+      ECDSA_SIG_free(es);
+      if (!ok) throw std::runtime_error("ECDSA signature does not fit the curve");
+      sig = std::move(raw);
+    }
   } catch (const std::exception &e) {
     EVP_MD_CTX_free(ctx);
     throw OidcError("protocol", std::string("the client assertion could not be signed: ") + e.what());
@@ -227,6 +251,53 @@ bool VerifyHMAC(const std::string &secret, const std::string &alg, const uint8_t
   if (!HMAC(MDOf(spec->hash), secret.data(), static_cast<int>(secret.size()), input, len, mac, &maclen)) return false;
   if (maclen != sig_len) return false;
   return CRYPTO_memcmp(mac, sig, maclen) == 0;
+}
+
+EVP_PKEY *GenerateP256() {
+  EVP_PKEY *key = EVP_EC_gen("P-256");
+  if (!key) throw OidcError("config", "the DPoP key could not be generated: " + OsslText());
+  return key;
+}
+
+J PublicJWKOfP256(EVP_PKEY *key) {
+  BIGNUM *x = nullptr;
+  BIGNUM *y = nullptr;
+  if (!key || EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_X, &x) != 1 ||
+      EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_Y, &y) != 1) {
+    BN_free(x);
+    BN_free(y);
+    throw OidcError("config", "the DPoP key has no P-256 public point");
+  }
+  uint8_t xb[32];
+  uint8_t yb[32];
+  bool ok = BN_bn2binpad(x, xb, 32) == 32 && BN_bn2binpad(y, yb, 32) == 32;
+  BN_free(x);
+  BN_free(y);
+  if (!ok) throw OidcError("config", "the DPoP key is not a P-256 key");
+  // RFC 7638: the required members in lexicographic order, which is also the thumbprint input.
+  J jwk = J::obj();
+  jwk.set("crv", J::str("P-256"));
+  jwk.set("kty", J::str("EC"));
+  jwk.set("x", J::str(B64URLEncode(xb, 32)));
+  jwk.set("y", J::str(B64URLEncode(yb, 32)));
+  return jwk;
+}
+
+std::string JWKThumbprint(const J &jwk) {
+  J members = J::obj();
+  for (const char *name : {"crv", "kty", "x", "y"}) members.set(name, J::str(Sprint(jwk.find(name))));
+  std::string input = Stringify(members);
+  unsigned char sum[EVP_MAX_MD_SIZE];
+  unsigned int n = 0;
+  EVP_Digest(input.data(), input.size(), sum, &n, EVP_sha256(), nullptr);
+  return B64URLEncode(sum, n);
+}
+
+std::string SHA256B64URL(const std::string &value) {
+  unsigned char sum[EVP_MAX_MD_SIZE];
+  unsigned int n = 0;
+  EVP_Digest(value.data(), value.size(), sum, &n, EVP_sha256(), nullptr);
+  return B64URLEncode(sum, n);
 }
 
 EVP_PKEY *PublicKeyFromJWK(const J &jwk) {

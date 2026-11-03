@@ -57,7 +57,29 @@ if (iya_oidc_complete(rp, keys, vals, n, txn, &who, &err) != IYA_OIDC_OK) return
 
 A C function logs once with `fprintf(stderr, "oidc: %s: %s\n", code, message)` and returns the integer code. `err.message` is the same text. `iya_oidc_error_name` maps the code to the same names as `iya::OidcError::code`.
 
-Tokens stay in this process. Keep the transaction until the browser returns. A code is accepted once. A callback that is not this sign-in is refused. ID tokens are checked, including `at_hash`.
+Tokens stay in this process. Keep the transaction until the browser returns. A code is accepted once. A callback that is not this sign-in is refused. ID tokens are checked, including `typ` and `at_hash`.
+
+`iya_oidc_create` (`RelyingParty::Create`) and `iya_oidc_open_file` (`RelyingParty::FromFile`) resolve the configuration the same way: the same defaults, the same redirect-URI rule, and metadata given inline (`metadata`) is validated like discovered metadata. A relative path in a configuration given to `iya_oidc_create` is read from the current directory.
+
+### DPoP (RFC 9449)
+
+`dpop` is `auto` (default), `always`, or `never`. `auto` uses DPoP when the provider lists `ES256` in `dpop_signing_alg_values_supported`; `always` fails at creation when it does not; `never` sends no proofs. The key is a P-256 key generated when the relying party is created and held in memory, or the PEM key `dpopKey` names (for an application that runs several processes). A proof goes on every request to the PAR and token endpoints (code, refresh and client-credentials grants), and on every resource request made with a DPoP-bound token (UserInfo, the SSF transmitter), with `ath`. `dpop_jkt` is sent on the authorization request (in the PAR body when PAR is used). A `use_dpop_nonce` answer (400 from the authorization server, 401 with `WWW-Authenticate: DPoP error="use_dpop_nonce"` from a resource server) is retried once with the nonce it gave, and the latest nonce per server origin goes on the next proof. When a proof was sent the `token_type` must be `DPoP`, and when none was it must be `Bearer`.
+
+```c
+int status = 0;
+char *body = NULL;
+iya_oidc_resource_request(rp, "GET", "https://api.example/items", token, NULL, NULL, &status, &body, &err);
+```
+
+`iya_oidc_resource_request` (`RelyingParty::ResourceRequest`) sends `Authorization: Bearer` or `Authorization: DPoP` with a proof as this relying party's tokens require. `iya_oidc_receiver_new_for_rp` (`iya::SignalsOptionsFor`) builds a receiver whose every transmitter call carries a client-credentials token from the relying party, with a proof when it is DPoP-bound.
+
+### The session token cache
+
+`Complete` keeps the tokens of a completed sign-in under a session identifier: the one passed to `iya_oidc_complete_session` (`Complete(query, txn, session_id)`), or one the library chooses (`iya_oidc_login_session_id`). `iya_oidc_session_access_token` (`SessionAccessToken`) returns the cached access token while it has more than 30 seconds left, and otherwise refreshes it (with a DPoP proof when DPoP is in use) and updates the entry. A failed refresh removes the entry and is refused. `iya_oidc_session_remove` (`RemoveSession`) clears an entry at sign-out; a receiver made with `iya_oidc_receiver_new_for_rp` also clears it when a CAEP event ends the session. The store is in memory; `iya_oidc_set_session_store` (`SetSessionStore`, an `iya::SessionStore`) replaces it with one shared by several processes.
+
+### ID tokens
+
+The accepted algorithms are `idTokenSigningAlgs` (default `["RS256"]`) narrowed to the ones the provider advertises; creation fails when none is left. `idTokenSignedResponseAlg` pins one algorithm, which the provider must advertise. `none` is never accepted, and a symmetric algorithm (`HS256`) only when it is named. The header must carry `typ` (`JWT` or `application/jwt`), and when the token response carries an access token the ID token must carry a matching `at_hash`; `requireIdTokenTypAndAtHash: false` checks them only when present. An `iat` more than `clockToleranceSec` in the future is refused. When `acr_values` is requested (`acrValues`, or `iya_oidc_authorize_with`), the ID token from the code exchange must carry an `acr` that is one of them; a refresh does not check it again.
 
 ## Configuration
 
@@ -66,21 +88,27 @@ Tokens stay in this process. Keep the transaction until the browser returns. A c
 | `clientId`, `client_id` | Confidential client identifier. Required. |
 | `clientSecret` | Literal, `env:NAME`, or `file:path`. Required unless `private_key_jwt`. |
 | `tokenEndpointAuthMethod` | `client_secret_basic` (default), `client_secret_post`, or `private_key_jwt`. `"none"` is refused. |
-| `redirectUri`, `redirect_uri` | Authorization code redirect. Required. |
+| `redirectUri`, `redirect_uri` | Authorization code redirect. Required. `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]`; `allowInsecure` does not widen this. A per-request redirect URI is held to the same rule. |
 | `postLogoutRedirectUri`, `post_logout_redirect_uri` | Optional end-session redirect. |
 | `scopes` | String or array. Must include `openid`. Omitted uses `openid profile email offline_access ssf.read ssf.manage`. |
 | `signals` | Omitted or `true` keeps CAEP and RISC. `false` drops `ssf.read` and `ssf.manage` from the applied scope list and does not start the receiver. |
 | `metadataUrl` | `https://issuer/.well-known/openid-configuration`. |
 | `issuer` | Must match the issuer in that URL when both are set. |
 | `metadataFile` | Provider metadata already on disk. |
+| `metadata` | Provider metadata as an object, validated like discovered metadata. |
 | `privateKey` | PEM for `private_key_jwt`, as a literal, `env:NAME`, `file:path`, or a path. |
 | `privateKeyAlg` | Defaults to `RS256`. |
 | `tlsCa` | The provider's TLS listener CA trust chain: PEM, inline, `file:`, `env:`, or a path (demo: `generated/idp-ca.pem`). Every certificate in it is a trust anchor, and the system roots are not added. A missing file or an empty env var omits the key, and the system roots are used. |
-| `par` | `auto` (default), `always`, or `never`. |
+| `par` | `auto` (default), `always`, or `never`. When the provider sets `require_pushed_authorization_requests`, `never` fails at creation and `auto` always pushes. `always` without a PAR endpoint fails at creation. |
+| `dpop` | `auto` (default), `always`, or `never`. |
+| `dpopKey` | Optional P-256 PEM private key for DPoP, as a literal, `env:NAME`, `file:path`, or a path. Generated in memory when omitted. |
+| `idTokenSigningAlgs` | Accepted ID token algorithms, a list. Defaults to `["RS256"]`. |
 | `idTokenSignedResponseAlg` | Pins the ID token algorithm when set. |
+| `requireIdTokenTypAndAtHash` | Defaults to `true`. `false` checks `typ` and `at_hash` only when present. |
+| `acrValues` | `acr_values` to request, a string or a list. The ID token's `acr` must be one of them. |
 | `clockToleranceSec` | Defaults to 30. |
 | `maxIdTokenAgeSec` | Defaults to 600. |
-| `allowInsecure` | Allows a non-loopback `http` provider in development. |
+| `allowInsecure` | Allows a non-loopback `http` provider in development. It does not relax the redirect-URI rule. |
 | `ssf.transmitter` | Transmitter base URL. A trailing slash is removed. Required only when `signals` is on and the object is present. |
 | `ssf.pollIntervalMs` | Poll pause in milliseconds. `3000` stays a poll interval. |
 
