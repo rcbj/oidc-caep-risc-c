@@ -396,24 +396,20 @@ struct App {
     }
     int interval = party->poll_interval_ms();
     if (interval <= 0) interval = 5000;
-    iya::SignalsReceiver::Options opts;
-    opts.tls_ca = party->tls_ca();
+    // Every transmitter call carries the client-credentials token, with a DPoP
+    // proof when the provider binds it (and one retry for a DPoP nonce).
+    iya::SignalsReceiver::Options opts = iya::SignalsOptionsFor(*party, "ssf.manage");
     opts.poll_interval_ms = interval;
     opts.description = "oidc-caep-risc-c demo (" + party->client_id() + ")";
-    opts.headers = [party] {
-      try {
-        iya::Access access = party->ClientCredentials("ssf.manage");
-        return std::map<std::string, std::string>{{"Authorization", "Bearer " + access.access_token}};
-      } catch (const std::exception &) {
-        return std::map<std::string, std::string>{};
-      }
-    };
     try {
       receiver = iya::SignalsReceiver::New(
           party->ssf_transmitter(),
-          [this](const std::vector<std::string> &ids, const iya::SignalEvent &) {
+          [this, party](const std::vector<std::string> &ids, const iya::SignalEvent &) {
             std::lock_guard<std::mutex> lock(mu);
-            for (const auto &id : ids) sessions.erase(id);
+            for (const auto &id : ids) {
+              sessions.erase(id);
+              party->RemoveSession(id);
+            }
           },
           opts);
       receiver->On("*", [this](const iya::SignalEvent &event) { RememberLiveEvent(event); });
@@ -437,6 +433,7 @@ struct App {
     std::string sid = sessions.begin()->first;
     sessions.clear();
     if (receiver) receiver->Untrack(sid);
+    if (rp) rp->RemoveSession(sid);
   }
 
   // {signedIn, subject, receiver, events: [{type, jti}]} for scripts/live_iya_sts.py.
@@ -517,6 +514,33 @@ struct App {
       party = Relying();
       if (!party) problem = "The relying party is not configured yet: " + rp_err + ". Run scripts/configure_iya_sts.py.";
     }
+    std::string token_note;
+    if (!sid.empty() && party) {
+      // An access token from the session cache (refreshed when it is about to
+      // expire), used for UserInfo with a DPoP proof when the token is DPoP-bound.
+      iya::Access access;
+      bool have = false;
+      try {
+        access = party->SessionAccessToken(sid);
+        have = true;
+      } catch (const std::exception &e) {
+        // No entry, or the refresh failed: the session is over.
+        std::fprintf(stderr, "session: %s\n", e.what());
+        std::lock_guard<std::mutex> lock(mu);
+        sessions.erase(sid);
+        if (receiver) receiver->Untrack(sid);
+        sid.clear();
+      }
+      if (have) {
+        try {
+          party->UserInfoSubject(access.access_token, sess.login.subject);
+          token_note = "UserInfo confirmed the subject with a " + access.token_type +
+                       " access token from the session cache.";
+        } catch (const std::exception &e) {
+          token_note = std::string("UserInfo was not reached: ") + e.what();
+        }
+      }
+    }
     if (!sid.empty()) {
       std::string who = sess.login.preferred_username;
       if (who.empty()) who = sess.login.email;
@@ -531,7 +555,8 @@ struct App {
         rows += "<tr><th>" + HtmlEscape(row.first) + "</th><td>" + HtmlEscape(row.second) + "</td></tr>";
       }
       std::string body = "<h1>Signed in as " + HtmlEscape(who) + "</h1><table class=\"facts\">" + rows +
-                         "</table><p><small>The access token and the refresh token stay in this process. This page does not show them.</small></p><p><small>Shared Signals: " +
+                         "</table><p><small>The access token and the refresh token stay in this process. This page does not show them. " +
+                         HtmlEscape(token_note) + "</small></p><p><small>Shared Signals: " +
                          HtmlEscape(State()) +
                          "</small></p><form method=\"post\" action=\"/logout\"><button type=\"submit\">Sign out</button></form>";
       Send(fd, 200, Page("Signed in", body), "text/html; charset=utf-8", {});
@@ -565,7 +590,8 @@ struct App {
       std::map<std::string, std::string> saved = {{"state", txn.state},
                                                   {"nonce", txn.nonce},
                                                   {"code_verifier", txn.code_verifier},
-                                                  {"redirect_uri", txn.redirect_uri}};
+                                                  {"redirect_uri", txn.redirect_uri},
+                                                  {"acr_values", txn.acr_values}};
       Redirect(fd, 302, txn.url, {Cookie(kTxn, Seal(saved), "/callback", 600)});
     } catch (const std::exception &e) {
       Send(fd, 500, Page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + HtmlEscape(e.what()) + "</p>"),
@@ -600,11 +626,13 @@ struct App {
     txn.nonce = saved["nonce"];
     txn.code_verifier = saved["code_verifier"];
     txn.redirect_uri = saved["redirect_uri"];
+    txn.acr_values = saved["acr_values"];
     try {
-      iya::Login login = party->Complete(QueryMap(req.query), txn);
       unsigned char buf[32];
       RAND_bytes(buf, sizeof buf);
       std::string sid = iya::B64URLEncode(buf, sizeof buf);
+      // The library keeps the tokens in its session cache under the cookie's id.
+      iya::Login login = party->Complete(QueryMap(req.query), txn, sid);
       {
         std::lock_guard<std::mutex> lock(mu);
         Session stored;
@@ -634,6 +662,7 @@ struct App {
       std::lock_guard<std::mutex> lock(mu);
       sessions.erase(sid);
       if (receiver) receiver->Untrack(sid);
+      if (rp) rp->RemoveSession(sid);
     }
     Redirect(fd, 303, "/", {Cookie(kSession, "", "/", 0)});
   }

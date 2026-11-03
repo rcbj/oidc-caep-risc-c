@@ -48,6 +48,13 @@ struct Checks {
   std::string previous_sub;
   bool has_max_age = false;
   double max_age = 0;
+  // requireIdTokenTypAndAtHash: typ must be present, and at_hash whenever an access
+  // token came with the ID token. A signed UserInfo response is not an ID token
+  // from the token endpoint and sets relax_typ.
+  bool require_typ = true;
+  bool require_at_hash = true;
+  bool relax_typ = false;
+  std::vector<std::string> acr_values;
 };
 
 struct TokenResp {
@@ -134,7 +141,7 @@ J ValidateProviderMetadata(const J &raw, const std::string &expected) {
     if (v && v->type != JType::Null) metadata.set(key, J::str(MustURL(v, key)));
   }
   for (const char *key : {"token_endpoint_auth_methods_supported", "code_challenge_methods_supported", "scopes_supported",
-                          "grant_types_supported"}) {
+                          "grant_types_supported", "dpop_signing_alg_values_supported"}) {
     const J *v = raw.find(key);
     if (!v || v->type == JType::Null) continue;
     std::vector<std::string> list;
@@ -144,6 +151,9 @@ J ValidateProviderMetadata(const J &raw, const std::string &expected) {
   const J *iss_param = raw.find("authorization_response_iss_parameter_supported");
   if (iss_param && iss_param->type != JType::Null)
     metadata.set("authorization_response_iss_parameter_supported", J::boolean(IsExactTrue(iss_param)));
+  const J *require_par = raw.find("require_pushed_authorization_requests");
+  if (require_par && require_par->type != JType::Null)
+    metadata.set("require_pushed_authorization_requests", J::boolean(IsExactTrue(require_par)));
   std::vector<std::string> response_types;
   if (!AsStringList(raw.find("response_types_supported"), response_types) ||
       !ContainsString(response_types, "code"))
@@ -163,23 +173,37 @@ J ValidateProviderMetadata(const J &raw, const std::string &expected) {
   return metadata;
 }
 
-std::vector<std::string> IDTokenAlgorithms(const std::vector<std::string> &advertised, const std::string &pinned) {
-  if (!pinned.empty()) {
-    if (!ContainsString(advertised, pinned))
-      throw OidcError("discovery", Fmt("the provider does not advertise id_token alg %s", pinned.c_str()));
-    return {pinned};
+std::string JoinCommaList(const std::vector<std::string> &list) {
+  std::string out;
+  for (size_t i = 0; i < list.size(); i++) {
+    if (i) out += ", ";
+    out += list[i];
   }
+  return out;
+}
+
+// The ID token algorithms this client accepts. idTokenSignedResponseAlg pins one,
+// and the provider must advertise it. Otherwise idTokenSigningAlgs (default RS256)
+// is narrowed to what the provider advertises, and creation fails only when nothing
+// is left. none is never accepted, and a symmetric (HS*) algorithm only because it
+// was named here.
+std::vector<std::string> IDTokenAlgorithms(const std::vector<std::string> &advertised, const std::string &pinned,
+                                           const std::vector<std::string> &listed) {
+  std::vector<std::string> wanted;
+  if (!pinned.empty()) wanted = {pinned};
+  else if (!listed.empty()) wanted = listed;
+  else wanted = {"RS256"};
   std::vector<std::string> allowed;
-  for (const auto &alg : advertised)
-    if (ContainsString(AsymmetricAlgs(), alg)) allowed.push_back(alg);
-  if (allowed.empty()) {
-    std::string joined;
-    for (size_t i = 0; i < advertised.size(); i++) {
-      if (i) joined += ", ";
-      joined += advertised[i];
-    }
-    throw OidcError("discovery", "none of the provider's ID token algorithms can be verified (" + joined + ")");
+  for (const auto &alg : wanted) {
+    if (ToLower(alg) == "none") throw OidcError("config", "the ID token algorithm none is never accepted");
+    if (!LookupAlg(alg)) throw OidcError("config", Fmt("this client cannot verify ID tokens signed with %s", alg.c_str()));
+    if (ContainsString(advertised, alg)) allowed.push_back(alg);
   }
+  if (!pinned.empty() && allowed.empty())
+    throw OidcError("discovery", Fmt("the provider does not advertise id_token alg %s", pinned.c_str()));
+  if (allowed.empty())
+    throw OidcError("discovery", "the provider advertises none of the accepted ID token algorithms (" +
+                                     JoinCommaList(wanted) + ")");
   return allowed;
 }
 
@@ -287,12 +311,14 @@ bool SignalsOn(const J *value, bool present) {
   throw OidcError("config", "signals must be true or false");
 }
 
-std::string CheckRedirect(const std::string &value, const std::string &name, bool allow) {
+// A redirect URI is https, or http on a loopback host (localhost, 127.0.0.1, [::1]).
+// allowInsecure is for a development provider and does not widen this.
+std::string CheckRedirect(const std::string &value, const std::string &name) {
   URL u;
   if (!ParseURL(value, u) || u.host.empty())
     throw OidcError("config", Fmt("%s is not a URL: %s", name.c_str(), value.c_str()));
   if (u.scheme == "https") return value;
-  if (u.scheme == "http" && (IsLoopback(u.hostname()) || allow)) return value;
+  if (u.scheme == "http" && IsLoopback(u.hostname())) return value;
   throw OidcError("config", Fmt("%s must use https, or http on loopback: %s", name.c_str(), value.c_str()));
 }
 
@@ -351,6 +377,55 @@ J Resolve(const J &raw, const std::string &base) {
   if (par_v && par_v->type != JType::Null) par = Sprint(par_v);
   if (par != "auto" && par != "always" && par != "never")
     throw OidcError("config", "par must be auto, always, or never");
+  std::string dpop = "auto";
+  const J *dpop_v = raw.find("dpop");
+  if (dpop_v && dpop_v->type != JType::Null) dpop = Sprint(dpop_v);
+  if (dpop != "auto" && dpop != "always" && dpop != "never")
+    throw OidcError("config", "dpop must be auto, always, or never");
+  bool require_typ = true;
+  const J *rt_v = raw.find("requireIdTokenTypAndAtHash");
+  if (rt_v && rt_v->type != JType::Null) {
+    if (rt_v->type != JType::Bool) throw OidcError("config", "requireIdTokenTypAndAtHash must be true or false");
+    require_typ = rt_v->b;
+  }
+  std::vector<std::string> signing_algs;
+  const J *algs_v = raw.find("idTokenSigningAlgs");
+  if (algs_v && algs_v->type != JType::Null) {
+    std::vector<std::string> list;
+    if (algs_v->type == JType::Array) {
+      if (!AsStringList(algs_v, list)) throw OidcError("config", "idTokenSigningAlgs must be a list of algorithm names");
+    } else if (algs_v->type == JType::String) {
+      list = Fields(algs_v->s);
+    } else {
+      throw OidcError("config", "idTokenSigningAlgs must be a list of algorithm names");
+    }
+    for (auto item : list) {
+      item = Trim(item);
+      if (item.empty()) continue;
+      if (ToLower(item) == "none") throw OidcError("config", "the ID token algorithm none is never accepted");
+      if (!LookupAlg(item)) throw OidcError("config", Fmt("this client cannot verify ID tokens signed with %s", item.c_str()));
+      if (!ContainsString(signing_algs, item)) signing_algs.push_back(item);
+    }
+    if (signing_algs.empty()) throw OidcError("config", "idTokenSigningAlgs must name at least one algorithm");
+  }
+  std::string acr_values;
+  const J *acr_v = raw.find("acrValues");
+  if (acr_v && acr_v->type != JType::Null) {
+    std::vector<std::string> list;
+    if (acr_v->type == JType::Array) {
+      if (!AsStringList(acr_v, list)) throw OidcError("config", "acrValues must be a string or a list of strings");
+    } else if (acr_v->type == JType::String) {
+      list = Fields(acr_v->s);
+    } else {
+      throw OidcError("config", "acrValues must be a string or a list of strings");
+    }
+    std::vector<std::string> kept;
+    for (auto item : list) {
+      item = Trim(item);
+      if (!item.empty()) kept.push_back(item);
+    }
+    acr_values = JoinSpace(kept);
+  }
   std::string issuer;
   const J *issuer_v = raw.find("issuer");
   if (issuer_v && issuer_v->type != JType::Null && !Trim(Sprint(issuer_v)).empty()) issuer = Trim(Sprint(issuer_v));
@@ -366,8 +441,16 @@ J Resolve(const J &raw, const std::string &base) {
   }
   J metadata;
   bool has_metadata = false;
+  const J *embedded = raw.find("metadata");
   const J *mf = raw.find("metadataFile");
-  if (mf && mf->type != JType::Null && !Sprint(mf).empty()) {
+  if (embedded && embedded->type == JType::Object) {
+    // Metadata given in the configuration is held to the same rules as discovered metadata.
+    metadata = ValidateProviderMetadata(*embedded, issuer);
+    has_metadata = true;
+    issuer = Sprint(metadata.find("issuer"));
+  } else if (embedded && embedded->type != JType::Null) {
+    throw OidcError("config", "metadata must be a JSON object");
+  } else if (mf && mf->type != JType::Null && !Sprint(mf).empty()) {
     std::string full = JoinPath(base, Sprint(mf));
     std::string body;
     try {
@@ -396,8 +479,13 @@ J Resolve(const J &raw, const std::string &base) {
   if (needs_secret && client_secret.empty()) throw OidcError("config", Fmt("%s needs clientSecret", method.c_str()));
   std::string private_key;
   const J *pk = raw.find("privateKey");
+  if (!pk || pk->type == JType::Null || Sprint(pk).empty()) pk = raw.find("privateKeyPem");
   if (pk && pk->type != JType::Null && !Sprint(pk).empty())
     private_key = KeyValue(Sprint(pk), base, "the private key");
+  std::string dpop_key;
+  const J *dk = raw.find("dpopKey");
+  if (!dk || dk->type == JType::Null || Sprint(dk).empty()) dk = raw.find("dpopKeyPem");
+  if (dk && dk->type != JType::Null && !Sprint(dk).empty()) dpop_key = KeyValue(Sprint(dk), base, "the DPoP key");
   if (method == "private_key_jwt" && private_key.empty())
     throw OidcError("config", "private_key_jwt needs privateKey");
   std::string tls_ca;
@@ -422,7 +510,7 @@ J Resolve(const J &raw, const std::string &base) {
       }
     }
   }
-  std::string checked_redirect = CheckRedirect(redirect, "redirectUri", allow);
+  std::string checked_redirect = CheckRedirect(redirect, "redirectUri");
   J out = J::obj();
   if (!issuer.empty()) out.set("issuer", J::str(issuer));
   if (!metadata_url.empty()) out.set("metadataUrl", J::str(metadata_url));
@@ -435,11 +523,22 @@ J Resolve(const J &raw, const std::string &base) {
   else out.set("privateKeyAlg", J::str("RS256"));
   out.set("tokenEndpointAuthMethod", J::str(method));
   out.set("redirectUri", J::str(checked_redirect));
-  if (!post.empty()) out.set("postLogoutRedirectUri", J::str(CheckRedirect(post, "postLogoutRedirectUri", allow)));
+  if (!post.empty()) out.set("postLogoutRedirectUri", J::str(CheckRedirect(post, "postLogoutRedirectUri")));
   out.set("scopes", J::str(scopes));
   const J *pin = raw.find("idTokenSignedResponseAlg");
-  if (pin && pin->type != JType::Null && !Sprint(pin).empty()) out.set("idTokenSignedResponseAlg", *pin);
+  if (pin && pin->type != JType::Null && !Sprint(pin).empty()) {
+    std::string pinned = Trim(Sprint(pin));
+    if (ToLower(pinned) == "none") throw OidcError("config", "the ID token algorithm none is never accepted");
+    if (!LookupAlg(pinned))
+      throw OidcError("config", Fmt("this client cannot verify ID tokens signed with %s", pinned.c_str()));
+    out.set("idTokenSignedResponseAlg", J::str(pinned));
+  }
+  out.set("idTokenSigningAlgs", StringArray(signing_algs.empty() ? std::vector<std::string>{"RS256"} : signing_algs));
+  out.set("requireIdTokenTypAndAtHash", J::boolean(require_typ));
+  if (!acr_values.empty()) out.set("acrValues", J::str(acr_values));
   out.set("par", J::str(par));
+  out.set("dpop", J::str(dpop));
+  if (!dpop_key.empty()) out.set("dpopKeyPem", J::str(dpop_key));
   const J *tol = raw.find("clockToleranceSec");
   if (!tol || tol->type == JType::Null) out.set("clockToleranceSec", J::integer(30));
   else out.set("clockToleranceSec", *tol);
@@ -570,6 +669,8 @@ J ValidateIDToken(const std::string &token, const Checks &checks) {
     if (typ == name) banned = true;
   if (!typ.empty() && ((typ != "jwt" && typ != "application/jwt") || banned))
     throw OidcError("validation", "the ID token typ is " + Sprint(typv) + ", not an ID token");
+  if (typ.empty() && checks.require_typ && !checks.relax_typ)
+    throw OidcError("validation", "the ID token has no typ header (JWT or application/jwt is required)");
   if (StartsWith(alg, "HS") && checks.client_secret.empty())
     throw OidcError("config", alg + " ID tokens need the client secret");
   J payload = DecodePart(token, 1);
@@ -603,6 +704,9 @@ J ValidateIDToken(const std::string &token, const Checks &checks) {
   double nbf = 0;
   if (AsFloat(payload.find("nbf"), nbf) && nbf - checks.clock_tolerance > now)
     throw OidcError("validation", "the ID token was refused: nbf is in the future");
+  double issued = 0;
+  if (AsFloat(payload.find("iat"), issued) && issued - checks.clock_tolerance > now)
+    throw OidcError("validation", "the ID token was refused: iat is in the future");
   if (checks.has_max_id_age) {
     double iat = 0;
     if (!AsFloat(payload.find("iat"), iat)) throw OidcError("validation", "the ID token was refused: iat is missing");
@@ -623,8 +727,20 @@ J ValidateIDToken(const std::string &token, const Checks &checks) {
   }
   if (checks.has_previous && Sprint(payload.find("sub")) != checks.previous_sub)
     throw OidcError("validation", "the refreshed ID token is for a different subject");
-  if (!checks.access_token.empty()) CheckHash(payload.find("at_hash"), checks.access_token, alg, "at_hash");
+  if (!checks.access_token.empty()) {
+    const J *at_hash = payload.find("at_hash");
+    if ((!at_hash || at_hash->type == JType::Null) && checks.require_at_hash)
+      throw OidcError("validation", "the ID token has no at_hash, and the token response carried an access token");
+    CheckHash(at_hash, checks.access_token, alg, "at_hash");
+  }
   if (!checks.code.empty()) CheckHash(payload.find("c_hash"), checks.code, alg, "c_hash");
+  if (!checks.acr_values.empty()) {
+    const J *acr = payload.find("acr");
+    if (!acr || acr->type != JType::String || acr->s.empty())
+      throw OidcError("validation", "acr_values was requested and the ID token has no acr");
+    if (!ContainsString(checks.acr_values, acr->s))
+      throw OidcError("validation", "the ID token acr " + acr->s + " is not one of the requested acr_values");
+  }
   if (checks.has_max_age) {
     double auth_time = 0;
     if (!AsFloat(payload.find("auth_time"), auth_time))
@@ -653,6 +769,7 @@ Login LoginFrom(const TokenResp &tokens, const J &claims) {
   login.name = ClaimString(claims, "name");
   login.preferred_username = ClaimString(claims, "preferred_username");
   login.sid = ClaimString(claims, "sid");
+  login.acr = ClaimString(claims, "acr");
   login.refresh_token = tokens.refresh;
   if (tokens.has_expires) {
     login.expires_at = NowSec() + tokens.expires_in;
@@ -708,23 +825,99 @@ std::string ResolveConfigJSON(const std::string &raw_json, const std::string &ba
   return Stringify(Resolve(parsed, base_dir));
 }
 
+SessionStore::~SessionStore() = default;
+
+struct MemorySessionStore::Impl {
+  std::mutex mu;
+  std::map<std::string, SessionTokens> entries;
+};
+
+MemorySessionStore::MemorySessionStore() : impl_(std::make_unique<Impl>()) {}
+MemorySessionStore::~MemorySessionStore() = default;
+
+bool MemorySessionStore::Get(const std::string &session_id, SessionTokens &out) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  auto it = impl_->entries.find(session_id);
+  if (it == impl_->entries.end()) return false;
+  out = it->second;
+  return true;
+}
+
+void MemorySessionStore::Put(const std::string &session_id, const SessionTokens &tokens) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->entries[session_id] = tokens;
+}
+
+void MemorySessionStore::Remove(const std::string &session_id) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->entries.erase(session_id);
+}
+
+std::string ResourceResponse::header(const std::string &name) const {
+  std::string want = ToLower(name);
+  for (const auto &kv : headers)
+    if (ToLower(kv.first) == want) return kv.second;
+  return {};
+}
+
+namespace {
+
+// The seconds a cached session access token must still have left to be handed out.
+constexpr double kSessionMargin = 30;
+
+bool AsksForNonce(int status, const std::string &www_authenticate) {
+  if (status != 401) return false;
+  std::string lower = ToLower(www_authenticate);
+  return lower.find("dpop") != std::string::npos && lower.find("use_dpop_nonce") != std::string::npos;
+}
+
+SessionTokens TokensOf(const Login &login) {
+  SessionTokens tokens;
+  tokens.access_token = login.access_token;
+  tokens.token_type = login.token_type;
+  tokens.refresh_token = login.refresh_token;
+  tokens.id_token = login.id_token;
+  tokens.scope = login.scope;
+  tokens.subject = login.subject;
+  tokens.claims_json = login.claims_json;
+  tokens.expires_at = login.expires_at;
+  tokens.has_expires = login.has_expires;
+  return tokens;
+}
+
+}  // namespace
+
 struct RelyingParty::Impl {
   J config;
   J metadata;
   EVP_PKEY *key = nullptr;
+  EVP_PKEY *dpop_key = nullptr;
+  J dpop_jwk;
+  std::string dpop_jkt;
   std::vector<std::string> algs;
   std::mutex mu;
   std::vector<J> jwks;
   bool jwks_set = false;
   std::map<std::string, double> used;
+  std::map<std::string, std::string> nonces;
   std::string cc_scope;
   Access cc_token;
   double cc_until = 0;
   bool cc_set = false;
+  std::shared_ptr<SessionStore> sessions = std::make_shared<MemorySessionStore>();
+  std::mutex refresh_mu;
 
-  ~Impl() { FreeKey(key); }
+  ~Impl() {
+    FreeKey(key);
+    FreeKey(dpop_key);
+  }
 
   std::string Ca() const { return CaOf(config); }
+
+  std::shared_ptr<SessionStore> Sessions() {
+    std::lock_guard<std::mutex> lock(mu);
+    return sessions;
+  }
 
   std::vector<J> Keys(bool force) {
     {
@@ -755,6 +948,10 @@ struct RelyingParty::Impl {
         checks.max_id_age = age;
       }
     }
+    const J *strict = config.find("requireIdTokenTypAndAtHash");
+    bool require = !(strict && strict->type == JType::Bool && !strict->b);
+    checks.require_typ = require;
+    checks.require_at_hash = require;
     try {
       checks.jwks = Keys(false);
     } catch (const std::exception &) {
@@ -779,6 +976,47 @@ struct RelyingParty::Impl {
       }
       return ValidateIDToken(token, checks);
     }
+  }
+
+  // The origin a DPoP nonce belongs to: the server that issued it.
+  static std::string OriginOf(const std::string &url) {
+    URL u;
+    if (!ParseURL(url, u)) return url;
+    return u.origin();
+  }
+
+  void RememberNonce(const std::string &url, const std::string &nonce) {
+    if (nonce.empty()) return;
+    std::lock_guard<std::mutex> lock(mu);
+    nonces[OriginOf(url)] = nonce;
+  }
+
+  // A DPoP proof (RFC 9449 section 4.2) for one request. ath is set for a resource
+  // request made with an access token.
+  std::string Proof(const std::string &method, const std::string &url, const std::string &access_token) {
+    URL u;
+    if (!ParseURL(url, u)) throw OidcError("protocol", "a DPoP proof needs an http(s) URL, not " + url);
+    std::string htu = u.origin() + (u.path.empty() ? "/" : u.path);
+    std::string nonce;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      auto it = nonces.find(u.origin());
+      if (it != nonces.end()) nonce = it->second;
+    }
+    J header = J::obj();
+    header.set("typ", J::str("dpop+jwt"));
+    header.set("alg", J::str("ES256"));
+    header.set("jwk", dpop_jwk);
+    J claims = J::obj();
+    claims.set("jti", J::str(Uuid4()));
+    claims.set("htm", J::str(method));
+    claims.set("htu", J::str(htu));
+    claims.set("iat", J::integer(static_cast<std::int64_t>(std::time(nullptr))));
+    if (!nonce.empty()) claims.set("nonce", J::str(nonce));
+    if (!access_token.empty()) claims.set("ath", J::str(SHA256B64URL(access_token)));
+    std::string signing = B64URLEncode(Stringify(header)) + "." + B64URLEncode(Stringify(claims));
+    auto sig = SignJWS(dpop_key, "ES256", reinterpret_cast<const uint8_t *>(signing.data()), signing.size());
+    return signing + "." + B64URLEncode(sig.data(), sig.size());
   }
 
   void ApplyClientAuth(std::vector<std::pair<std::string, std::string>> &fields,
@@ -820,52 +1058,74 @@ struct RelyingParty::Impl {
     AddField(fields, "client_assertion", assertion);
   }
 
-  J PostForm(const std::string &endpoint, std::vector<std::pair<std::string, std::string>> fields,
-             std::vector<std::string> order) {
-    std::vector<std::pair<std::string, std::string>> headers = {{"accept", "application/json"},
-                                                                {"content-type", "application/x-www-form-urlencoded"}};
-    ApplyClientAuth(fields, headers);
-    for (const auto &kv : fields) {
-      if (!ContainsString(order, kv.first)) order.push_back(kv.first);
-    }
-    std::string encoded = FormBody(fields, order);
-    HttpResult answer = Send(endpoint, "POST", headers, &encoded, Ca(), "protocol");
-    J doc = J::obj();
-    if (!answer.body.empty()) {
-      try {
-        J parsed = Parse(answer.body);
-        if (parsed.type == JType::Object) doc = std::move(parsed);
-      } catch (const std::exception &) {
-        throw OidcError("protocol", endpoint + " answered " + std::to_string(answer.status) + " with no JSON");
+  // POST to the PAR or token endpoint. With DPoP every attempt carries a fresh
+  // proof (and a fresh client assertion), and a 400 use_dpop_nonce is answered
+  // once with the nonce it gave. proofed says whether a proof was sent.
+  J PostForm(const std::string &endpoint, const std::vector<std::pair<std::string, std::string>> &fields_in,
+             const std::vector<std::string> &order_in, bool *proofed = nullptr) {
+    for (int attempt = 0;; attempt++) {
+      auto fields = fields_in;
+      auto order = order_in;
+      std::vector<std::pair<std::string, std::string>> headers = {
+          {"accept", "application/json"}, {"content-type", "application/x-www-form-urlencoded"}};
+      ApplyClientAuth(fields, headers);
+      bool sent = false;
+      if (dpop_key) {
+        headers.emplace_back("DPoP", Proof("POST", endpoint, ""));
+        sent = true;
       }
+      for (const auto &kv : fields) {
+        if (!ContainsString(order, kv.first)) order.push_back(kv.first);
+      }
+      std::string encoded = FormBody(fields, order);
+      HttpResult answer = Send(endpoint, "POST", headers, &encoded, Ca(), "protocol");
+      std::string nonce = answer.header("DPoP-Nonce");
+      RememberNonce(endpoint, nonce);
+      J doc = J::obj();
+      if (!answer.body.empty()) {
+        try {
+          J parsed = Parse(answer.body);
+          if (parsed.type == JType::Object) doc = std::move(parsed);
+        } catch (const std::exception &) {
+          throw OidcError("protocol", endpoint + " answered " + std::to_string(answer.status) + " with no JSON");
+        }
+      }
+      if (answer.status != 200 && answer.status != 201) {
+        std::string oauth;
+        const J *err = doc.find("error");
+        if (err && err->type == JType::String) oauth = err->s;
+        if (sent && attempt == 0 && oauth == "use_dpop_nonce" && !nonce.empty()) continue;
+        std::string description;
+        const J *ed = doc.find("error_description");
+        if (ed && ed->type == JType::String) description = ed->s;
+        std::string message = endpoint + " answered " + std::to_string(answer.status);
+        if (!oauth.empty()) message += ": " + oauth;
+        if (!description.empty()) message += ": " + description;
+        throw OidcError("protocol", message, oauth);
+      }
+      if (proofed) *proofed = sent;
+      return doc;
     }
-    if (answer.status != 200 && answer.status != 201) {
-      std::string oauth;
-      const J *err = doc.find("error");
-      if (err && err->type == JType::String) oauth = err->s;
-      std::string description;
-      const J *ed = doc.find("error_description");
-      if (ed && ed->type == JType::String) description = ed->s;
-      std::string message = endpoint + " answered " + std::to_string(answer.status);
-      if (!oauth.empty()) message += ": " + oauth;
-      if (!description.empty()) message += ": " + description;
-      throw OidcError("protocol", message, oauth);
-    }
-    return doc;
   }
 
   TokenResp Token(std::vector<std::pair<std::string, std::string>> body, std::vector<std::string> order) {
-    J parsed = PostForm(Sprint(metadata.find("token_endpoint")), std::move(body), std::move(order));
+    bool proofed = false;
+    J parsed = PostForm(Sprint(metadata.find("token_endpoint")), body, order, &proofed);
     const J *access = parsed.find("access_token");
     const J *ttype = parsed.find("token_type");
     if (!access || access->type != JType::String || access->s.empty())
       throw OidcError("protocol", "the token response has no access_token");
     if (!ttype || ttype->type != JType::String || ttype->s.empty())
       throw OidcError("protocol", "the token response has no token_type");
-    if (ToLower(ttype->s) == "dpop")
-      throw OidcError("protocol", "the provider returned a DPoP token; this client asked for a Bearer token");
-    if (ToLower(ttype->s) != "bearer")
-      throw OidcError("protocol", "the token response token_type is " + ttype->s);
+    // RFC 9449 section 5: a proof asks for a DPoP-bound token, and its absence for a Bearer one.
+    std::string want = proofed ? "dpop" : "bearer";
+    if (ToLower(ttype->s) != want) {
+      if (proofed)
+        throw OidcError("protocol", "the token request carried a DPoP proof and the token_type is " + ttype->s +
+                                        ", not DPoP");
+      throw OidcError("protocol", "the token request carried no DPoP proof and the token_type is " + ttype->s +
+                                      ", not Bearer");
+    }
     TokenResp out;
     out.access = access->s;
     out.type = ttype->s;
@@ -878,6 +1138,41 @@ struct RelyingParty::Impl {
     }
     if (const J *sc = parsed.find("scope"); sc && sc->type == JType::String) out.scope = sc->s;
     return out;
+  }
+
+  std::map<std::string, std::string> ResourceHeaders(const std::string &method, const std::string &url,
+                                                     const std::string &access_token) {
+    std::map<std::string, std::string> out;
+    if (dpop_key) {
+      out["Authorization"] = "DPoP " + access_token;
+      out["DPoP"] = Proof(method, url, access_token);
+    } else {
+      out["Authorization"] = "Bearer " + access_token;
+    }
+    return out;
+  }
+
+  bool ResourceChallenge(const std::string &url, int status, const std::string &www, const std::string &nonce) {
+    RememberNonce(url, nonce);
+    return dpop_key && !nonce.empty() && AsksForNonce(status, www);
+  }
+
+  ResourceResponse Resource(const std::string &method, const std::string &url, const std::string &access_token,
+                            const std::vector<std::pair<std::string, std::string>> &extra, const std::string *body,
+                            const std::string &code) {
+    for (int attempt = 0;; attempt++) {
+      std::vector<std::pair<std::string, std::string>> headers = extra;
+      for (const auto &kv : ResourceHeaders(method, url, access_token)) headers.emplace_back(kv.first, kv.second);
+      HttpResult answer = Send(url, method, headers, body, Ca(), code);
+      bool again = ResourceChallenge(url, answer.status, answer.header("WWW-Authenticate"), answer.header("DPoP-Nonce"));
+      if (again && attempt == 0) continue;
+      ResourceResponse out;
+      out.status = answer.status;
+      out.content_type = answer.content_type;
+      out.body = answer.body;
+      out.headers = answer.headers;
+      return out;
+    }
   }
 
   void Remember(const std::string &code) {
@@ -900,6 +1195,8 @@ struct RelyingParty::Impl {
 RelyingParty::RelyingParty(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 RelyingParty::~RelyingParty() = default;
 
+// Every way of creating a relying party resolves the configuration first, so the
+// defaults, the redirect rule and the metadata checks are the same for all of them.
 std::unique_ptr<RelyingParty> RelyingParty::Create(const std::string &config_json) {
   J config;
   try {
@@ -908,6 +1205,11 @@ std::unique_ptr<RelyingParty> RelyingParty::Create(const std::string &config_jso
     throw OidcError("config", std::string("the configuration must be a JSON object: ") + e.what());
   }
   if (config.type != JType::Object) throw OidcError("config", "the configuration must be a JSON object");
+  return Make(Stringify(Resolve(config, "")));
+}
+
+std::unique_ptr<RelyingParty> RelyingParty::Make(const std::string &resolved_json) {
+  J config = Parse(resolved_json);
   std::string method = Sprint(config.find("tokenEndpointAuthMethod"));
   if (method == "private_key_jwt" && Sprint(config.find("privateKeyPem")).empty())
     throw OidcError("config", "private_key_jwt needs a private key");
@@ -943,6 +1245,14 @@ std::unique_ptr<RelyingParty> RelyingParty::Create(const std::string &config_jso
   if (AsStringList(metadata.find("code_challenge_methods_supported"), challenges) && !challenges.empty() &&
       !ContainsString(challenges, "S256"))
     throw OidcError("discovery", "the provider does not advertise PKCE S256");
+  std::string par = Sprint(config.find("par"));
+  bool par_required = IsExactTrue(metadata.find("require_pushed_authorization_requests"));
+  bool has_par = !Sprint(metadata.find("pushed_authorization_request_endpoint")).empty();
+  if (par_required && par == "never")
+    throw OidcError("config", "the provider requires pushed authorization requests, and par is never");
+  if ((par_required || par == "always") && !has_par)
+    throw OidcError("discovery", "pushed authorization requests are required, and the provider has no "
+                                 "pushed_authorization_request_endpoint");
   auto impl = std::make_unique<Impl>();
   std::string pem = Sprint(config.find("privateKeyPem"));
   if (!pem.empty()) {
@@ -951,9 +1261,26 @@ std::unique_ptr<RelyingParty> RelyingParty::Create(const std::string &config_jso
     impl->key = LoadPrivateKey(pem, alg);
   }
   std::string pinned = Sprint(config.find("idTokenSignedResponseAlg"));
+  std::vector<std::string> listed;
+  AsStringList(config.find("idTokenSigningAlgs"), listed);
   std::vector<std::string> advertised;
   AsStringList(metadata.find("id_token_signing_alg_values_supported"), advertised);
-  impl->algs = IDTokenAlgorithms(advertised, pinned);
+  impl->algs = IDTokenAlgorithms(advertised, pinned, listed);
+  std::string dpop = Sprint(config.find("dpop"));
+  if (dpop.empty()) dpop = "auto";
+  std::vector<std::string> dpop_algs;
+  AsStringList(metadata.find("dpop_signing_alg_values_supported"), dpop_algs);
+  bool es256 = ContainsString(dpop_algs, "ES256");
+  if (dpop == "always" && dpop_algs.empty())
+    throw OidcError("discovery", "dpop is always, and the provider does not advertise dpop_signing_alg_values_supported");
+  if (dpop == "always" && !es256)
+    throw OidcError("discovery", "dpop is always, and the provider does not advertise ES256 for DPoP proofs");
+  if (dpop != "never" && es256) {
+    std::string dpop_pem = Sprint(config.find("dpopKeyPem"));
+    impl->dpop_key = dpop_pem.empty() ? GenerateP256() : LoadPrivateKey(dpop_pem, "ES256");
+    impl->dpop_jwk = PublicJWKOfP256(impl->dpop_key);
+    impl->dpop_jkt = JWKThumbprint(impl->dpop_jwk);
+  }
   impl->config = std::move(config);
   impl->metadata = std::move(metadata);
   return std::unique_ptr<RelyingParty>(new RelyingParty(std::move(impl)));
@@ -975,14 +1302,18 @@ std::unique_ptr<RelyingParty> RelyingParty::FromFile(const std::string &path) {
   if (parsed.type != JType::Object) throw OidcError("config", "the configuration must be a JSON object");
   std::filesystem::path abs = std::filesystem::absolute(path);
   J resolved = Resolve(parsed, abs.parent_path().string());
-  return Create(Stringify(resolved));
+  return Make(Stringify(resolved));
 }
 
 Transaction RelyingParty::Authorize() { return Authorize(AuthorizeOptions{}); }
 
 Transaction RelyingParty::Authorize(const AuthorizeOptions &opts) {
-  std::string redirect = opts.redirect_uri.empty() ? Sprint(impl_->config.find("redirectUri")) : opts.redirect_uri;
+  std::string redirect = Sprint(impl_->config.find("redirectUri"));
+  if (!opts.redirect_uri.empty())
+    redirect = CheckRedirect(opts.redirect_uri, "redirect_uri");
   std::string scope = opts.scope.empty() ? Sprint(impl_->config.find("scopes")) : opts.scope;
+  std::string acr_values = JoinSpace(Fields(opts.acr_values.empty() ? Sprint(impl_->config.find("acrValues"))
+                                                                     : opts.acr_values));
   Transaction txn;
   try {
     txn.state = RandomToken();
@@ -995,6 +1326,7 @@ Transaction RelyingParty::Authorize(const AuthorizeOptions &opts) {
   txn.has_max_age = opts.has_max_age;
   txn.max_age = opts.max_age;
   txn.expected_sub = opts.expected_sub;
+  txn.acr_values = acr_values;
   std::vector<std::pair<std::string, std::string>> params = {
       {"response_type", "code"},
       {"client_id", Sprint(impl_->config.find("clientId"))},
@@ -1019,16 +1351,23 @@ Transaction RelyingParty::Authorize(const AuthorizeOptions &opts) {
     params.emplace_back("max_age", TrimFloat(opts.max_age));
     order.push_back("max_age");
   }
-  if (!opts.acr_values.empty()) {
-    params.emplace_back("acr_values", opts.acr_values);
+  if (!acr_values.empty()) {
+    params.emplace_back("acr_values", acr_values);
     order.push_back("acr_values");
+  }
+  if (impl_->dpop_key) {
+    // RFC 9449 section 10: binds the authorization code to this client's DPoP key.
+    params.emplace_back("dpop_jkt", impl_->dpop_jkt);
+    order.push_back("dpop_jkt");
   }
   std::string par_endpoint = Sprint(impl_->metadata.find("pushed_authorization_request_endpoint"));
   std::string mode = Sprint(impl_->config.find("par"));
-  bool use_par = mode == "always" || (mode == "auto" && !par_endpoint.empty());
-  if (mode == "always" && par_endpoint.empty())
-    throw OidcError("discovery", "par is always, and the provider has no pushed authorization endpoint");
-  if (use_par && !par_endpoint.empty()) {
+  bool required = IsExactTrue(impl_->metadata.find("require_pushed_authorization_requests"));
+  bool use_par = mode == "always" || required || (mode == "auto" && !par_endpoint.empty());
+  if (use_par && par_endpoint.empty())
+    throw OidcError("discovery", "pushed authorization requests are required, and the provider has no pushed "
+                                 "authorization endpoint");
+  if (use_par) {
     J pushed = impl_->PostForm(par_endpoint, params, order);
     const J *request_uri = pushed.find("request_uri");
     if (!request_uri || request_uri->type != JType::String || request_uri->s.empty())
@@ -1043,6 +1382,11 @@ Transaction RelyingParty::Authorize(const AuthorizeOptions &opts) {
 }
 
 Login RelyingParty::Complete(const std::map<std::string, std::string> &query, const Transaction &txn) {
+  return Complete(query, txn, std::string());
+}
+
+Login RelyingParty::Complete(const std::map<std::string, std::string> &query, const Transaction &txn,
+                             const std::string &session_id) {
   for (const char *name : kFront) {
     if (query.count(name))
       throw OidcError("validation", Fmt("%s was returned on the redirect, and a code-flow client refuses it", name));
@@ -1077,6 +1421,7 @@ Login RelyingParty::Complete(const std::map<std::string, std::string> &query, co
   extra.nonce = txn.nonce;
   extra.access_token = tokens.access;
   extra.code = code;
+  extra.acr_values = Fields(txn.acr_values);
   if (txn.has_max_age) {
     extra.has_max_age = true;
     extra.max_age = txn.max_age;
@@ -1084,7 +1429,10 @@ Login RelyingParty::Complete(const std::map<std::string, std::string> &query, co
   J claims = impl_->IdToken(tokens.id_token, extra);
   if (!txn.expected_sub.empty() && Sprint(claims.find("sub")) != txn.expected_sub)
     throw OidcError("validation", "the provider signed in a different account from the one requested");
-  return LoginFrom(tokens, claims);
+  Login login = LoginFrom(tokens, claims);
+  login.session_id = session_id.empty() ? RandomToken() : session_id;
+  impl_->Sessions()->Put(login.session_id, TokensOf(login));
+  return login;
 }
 
 Login RelyingParty::Refresh(const std::string &refresh_token, const std::string &scope, const Login *previous) {
@@ -1110,6 +1458,7 @@ Login RelyingParty::Refresh(const std::string &refresh_token, const std::string 
   if (!tokens.id_token.empty()) {
     if (!previous)
       throw OidcError("validation", "the refresh returned an ID token and there is no previous sign-in to check it against");
+    // acr is not checked again on a refresh.
     Checks extra;
     extra.access_token = tokens.access;
     extra.has_previous = true;
@@ -1122,7 +1471,9 @@ Login RelyingParty::Refresh(const std::string &refresh_token, const std::string 
     throw OidcError("protocol", "the refresh returned no ID token and no previous sign-in was given");
   if (tokens.refresh.empty()) tokens.refresh = refresh_token;
   tokens.id_token = id_token;
-  return LoginFrom(tokens, claims);
+  Login login = LoginFrom(tokens, claims);
+  if (previous) login.session_id = previous->session_id;
+  return login;
 }
 
 Access RelyingParty::ClientCredentials(const std::string &scope_in) {
@@ -1155,14 +1506,14 @@ std::string RelyingParty::UserInfoSubject(const std::string &access_token, const
   if (expected_sub.empty()) throw OidcError("validation", "userinfo needs the subject to check the response against");
   std::string endpoint = Sprint(impl_->metadata.find("userinfo_endpoint"));
   if (endpoint.empty()) throw OidcError("discovery", "the provider has no userinfo_endpoint");
-  HttpResult answer = Send(endpoint, "GET",
-                           {{"accept", "application/json, application/jwt"}, {"authorization", "Bearer " + access_token}},
-                           nullptr, impl_->Ca(), "protocol");
+  ResourceResponse answer =
+      impl_->Resource("GET", endpoint, access_token, {{"accept", "application/json, application/jwt"}}, nullptr, "protocol");
   if (answer.status == 401) throw OidcError("protocol", "userinfo refused the access token", "invalid_token");
   if (answer.status != 200) throw OidcError("protocol", Fmt("userinfo answered %d", answer.status));
   if (ToLower(answer.content_type).find("application/jwt") != std::string::npos) {
     Checks extra;
     extra.algorithms = impl_->algs;
+    extra.relax_typ = true;
     J claims = impl_->IdToken(Trim(answer.body), extra);
     if (Sprint(claims.find("sub")) != expected_sub)
       throw OidcError("validation", "userinfo sub does not match the ID token sub");
@@ -1207,6 +1558,84 @@ std::string RelyingParty::EndSessionURL(const EndSessionOptions &opts) {
   return WithQuery(endpoint, query, order);
 }
 
+Access RelyingParty::SessionAccessToken(const std::string &session_id) {
+  if (session_id.empty()) throw OidcError("validation", "a session identifier is required");
+  auto store = impl_->Sessions();
+  auto fresh = [](const SessionTokens &tokens, Access &out) {
+    if (tokens.access_token.empty()) return false;
+    if (tokens.has_expires && tokens.expires_at - NowSec() <= kSessionMargin) return false;
+    out.access_token = tokens.access_token;
+    out.token_type = tokens.token_type;
+    out.scope = tokens.scope;
+    out.expires_at = tokens.expires_at;
+    out.has_expires = tokens.has_expires;
+    return true;
+  };
+  SessionTokens tokens;
+  if (!store->Get(session_id, tokens)) throw OidcError("validation", "there is no signed-in session " + session_id);
+  Access access;
+  if (fresh(tokens, access)) return access;
+  // One refresh at a time, so a rotated refresh token is not spent twice; a
+  // caller that waited finds the entry the first one wrote.
+  std::lock_guard<std::mutex> lock(impl_->refresh_mu);
+  if (!store->Get(session_id, tokens)) throw OidcError("validation", "there is no signed-in session " + session_id);
+  if (fresh(tokens, access)) return access;
+  if (tokens.refresh_token.empty()) {
+    store->Remove(session_id);
+    throw OidcError("protocol", "the session's access token expired and there is no refresh token", "invalid_grant");
+  }
+  Login previous;
+  previous.subject = tokens.subject;
+  previous.claims_json = tokens.claims_json;
+  previous.id_token = tokens.id_token;
+  previous.session_id = session_id;
+  Login renewed;
+  try {
+    renewed = Refresh(tokens.refresh_token, "", &previous);
+  } catch (...) {
+    store->Remove(session_id);
+    throw;
+  }
+  store->Put(session_id, TokensOf(renewed));
+  access.access_token = renewed.access_token;
+  access.token_type = renewed.token_type;
+  access.scope = renewed.scope;
+  access.expires_at = renewed.expires_at;
+  access.has_expires = renewed.has_expires;
+  return access;
+}
+
+void RelyingParty::RemoveSession(const std::string &session_id) {
+  if (session_id.empty()) return;
+  impl_->Sessions()->Remove(session_id);
+}
+
+void RelyingParty::SetSessionStore(std::shared_ptr<SessionStore> store) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  impl_->sessions = store ? std::move(store) : std::make_shared<MemorySessionStore>();
+}
+
+ResourceResponse RelyingParty::ResourceRequest(const std::string &method, const std::string &url,
+                                               const std::string &access_token,
+                                               const std::vector<std::pair<std::string, std::string>> &headers,
+                                               const std::string *body) {
+  if (access_token.empty()) throw OidcError("protocol", "a resource request needs an access token");
+  return impl_->Resource(method.empty() ? "GET" : method, url, access_token, headers, body, "protocol");
+}
+
+std::map<std::string, std::string> RelyingParty::ResourceHeaders(const std::string &method, const std::string &url,
+                                                                 const std::string &access_token) {
+  return impl_->ResourceHeaders(method.empty() ? "GET" : method, url, access_token);
+}
+
+bool RelyingParty::ResourceChallenge(const std::string &url, int status, const std::string &www_authenticate,
+                                     const std::string &dpop_nonce) {
+  return impl_->ResourceChallenge(url, status, www_authenticate, dpop_nonce);
+}
+
+bool RelyingParty::dpop() const { return impl_->dpop_key != nullptr; }
+std::string RelyingParty::dpop_jkt() const { return impl_->dpop_jkt; }
+
 bool RelyingParty::signals_off() const {
   const J *s = impl_->config.find("signals");
   return s && s->type == JType::Bool && !s->b;
@@ -1228,6 +1657,22 @@ int RelyingParty::poll_interval_ms() const {
   double v = 0;
   if (!AsFloat(ssf->find("pollIntervalMs"), v)) return 0;
   return static_cast<int>(v);
+}
+
+SignalsReceiver::Options SignalsOptionsFor(RelyingParty &rp, const std::string &scope_in) {
+  std::string scope = scope_in.empty() ? "ssf.manage" : scope_in;
+  SignalsReceiver::Options opts;
+  RelyingParty *party = &rp;
+  opts.request_headers = [party, scope](const std::string &method, const std::string &url) {
+    Access access = party->ClientCredentials(scope);
+    return party->ResourceHeaders(method, url, access.access_token);
+  };
+  opts.on_response = [party](const std::string &url, int status, const std::string &www, const std::string &nonce) {
+    return party->ResourceChallenge(url, status, www, nonce);
+  };
+  opts.tls_ca = rp.tls_ca();
+  opts.poll_interval_ms = rp.poll_interval_ms();
+  return opts;
 }
 
 }  // namespace iya

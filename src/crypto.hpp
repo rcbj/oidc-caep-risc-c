@@ -35,6 +35,12 @@ bool VerifyHMAC(const std::string &secret, const std::string &alg, const uint8_t
                 const uint8_t *sig, size_t sig_len);
 EVP_PKEY *PublicKeyFromJWK(const J &jwk);
 
+// DPoP (RFC 9449): a fresh P-256 key, its public JWK, and its RFC 7638 thumbprint.
+EVP_PKEY *GenerateP256();
+J PublicJWKOfP256(EVP_PKEY *key);
+std::string JWKThumbprint(const J &jwk);
+std::string SHA256B64URL(const std::string &value);
+
 }  // namespace iya
 
 #endif

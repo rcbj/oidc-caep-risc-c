@@ -52,6 +52,9 @@ struct Transaction {
   bool has_max_age = false;
   double max_age = 0;
   std::string expected_sub;
+  // The acr_values this sign-in asked for (space-separated). When it is not empty,
+  // Complete requires the ID token's acr to be one of them.
+  std::string acr_values;
 };
 
 struct AuthorizeOptions {
@@ -80,6 +83,10 @@ struct Login {
   std::string claims_json;
   double expires_at = 0;
   bool has_expires = false;
+  // The key of this sign-in's entry in the session token cache: the one the
+  // application passed to Complete, or one the library chose.
+  std::string session_id;
+  std::string acr;
 };
 
 struct Access {
@@ -98,6 +105,52 @@ struct EndSessionOptions {
   std::string logout_hint;
 };
 
+// The tokens of one completed sign-in, as the session token cache keeps them.
+struct SessionTokens {
+  std::string access_token;
+  std::string token_type;
+  std::string refresh_token;
+  std::string id_token;
+  std::string scope;
+  std::string subject;
+  std::string claims_json;
+  double expires_at = 0;
+  bool has_expires = false;
+};
+
+// Where the session token cache lives. The default is MemorySessionStore; an
+// application that runs several processes supplies one over a shared store.
+// Every method may be called from several threads at once.
+class SessionStore {
+ public:
+  virtual ~SessionStore();
+  virtual bool Get(const std::string &session_id, SessionTokens &out) = 0;
+  virtual void Put(const std::string &session_id, const SessionTokens &tokens) = 0;
+  virtual void Remove(const std::string &session_id) = 0;
+};
+
+class MemorySessionStore : public SessionStore {
+ public:
+  MemorySessionStore();
+  ~MemorySessionStore() override;
+  bool Get(const std::string &session_id, SessionTokens &out) override;
+  void Put(const std::string &session_id, const SessionTokens &tokens) override;
+  void Remove(const std::string &session_id) override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// The answer to a resource request made with an access token.
+struct ResourceResponse {
+  int status = 0;
+  std::string content_type;
+  std::string body;
+  std::vector<std::pair<std::string, std::string>> headers;
+  std::string header(const std::string &name) const;
+};
+
 class RelyingParty {
  public:
   ~RelyingParty();
@@ -106,11 +159,37 @@ class RelyingParty {
 
   Transaction Authorize();
   Transaction Authorize(const AuthorizeOptions &opts);
+  // Both forms keep the tokens in the session token cache: under session_id, or
+  // under a new identifier returned in Login::session_id.
   Login Complete(const std::map<std::string, std::string> &query, const Transaction &txn);
+  Login Complete(const std::map<std::string, std::string> &query, const Transaction &txn,
+                 const std::string &session_id);
   Login Refresh(const std::string &refresh_token, const std::string &scope, const Login *previous);
   Access ClientCredentials(const std::string &scope);
   std::string UserInfoSubject(const std::string &access_token, const std::string &expected_sub);
   std::string EndSessionURL(const EndSessionOptions &opts);
+
+  // A valid access token for a session: the cached one while it has more than
+  // 30 seconds left, otherwise one from the refresh token (the cache is updated).
+  // A failed refresh removes the entry and throws.
+  Access SessionAccessToken(const std::string &session_id);
+  void RemoveSession(const std::string &session_id);
+  void SetSessionStore(std::shared_ptr<SessionStore> store);
+
+  // A request to a resource server with an access token from this relying party:
+  // Bearer, or DPoP with a proof (and one retry on a use_dpop_nonce challenge).
+  ResourceResponse ResourceRequest(const std::string &method, const std::string &url, const std::string &access_token,
+                                   const std::vector<std::pair<std::string, std::string>> &headers = {},
+                                   const std::string *body = nullptr);
+  // The Authorization (and DPoP) headers for one resource request.
+  std::map<std::string, std::string> ResourceHeaders(const std::string &method, const std::string &url,
+                                                     const std::string &access_token);
+  // Remembers a DPoP-Nonce from a resource response; true when the request should
+  // be sent once more because the resource server asked for a nonce.
+  bool ResourceChallenge(const std::string &url, int status, const std::string &www_authenticate,
+                         const std::string &dpop_nonce);
+  bool dpop() const;
+  std::string dpop_jkt() const;
 
   bool signals_off() const;
   std::string client_id() const;
@@ -122,6 +201,7 @@ class RelyingParty {
  private:
   struct Impl;
   explicit RelyingParty(std::unique_ptr<Impl> impl);
+  static std::unique_ptr<RelyingParty> Make(const std::string &resolved_json);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -137,6 +217,13 @@ class SignalsReceiver {
  public:
   struct Options {
     std::function<std::map<std::string, std::string>()> headers;
+    // Per-request headers, for a DPoP proof bound to the method and URL.
+    std::function<std::map<std::string, std::string>(const std::string &method, const std::string &url)>
+        request_headers;
+    // Called with every response; true sends the request once more (a DPoP nonce).
+    std::function<bool(const std::string &url, int status, const std::string &www_authenticate,
+                       const std::string &dpop_nonce)>
+        on_response;
     int poll_interval_ms = 0;
     std::string description;
     std::string tls_ca;
@@ -165,6 +252,11 @@ class SignalsReceiver {
   explicit SignalsReceiver(std::shared_ptr<Impl> impl);
   std::shared_ptr<Impl> impl_;
 };
+
+// Receiver options whose every transmitter call carries a client-credentials
+// token from rp (scope ssf.manage by default) with a DPoP proof when the token
+// is DPoP-bound, and rp's tlsCa. rp must outlive the receiver.
+SignalsReceiver::Options SignalsOptionsFor(RelyingParty &rp, const std::string &scope = "ssf.manage");
 
 }  // namespace iya
 

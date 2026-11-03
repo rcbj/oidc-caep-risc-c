@@ -5,6 +5,7 @@
 #include "stub.h"
 
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 
 #include <ctype.h>
 #include <pthread.h>
@@ -777,5 +778,645 @@ int TestOidcErrorIsExported(void) {
   if (strcmp(err.message, "signals must be true or false") != 0) return failed(err.message);
   if (strcmp(iya_oidc_error_name(rc), "config") != 0) return failed("name");
   if (err.code != IYA_OIDC_ERR_CONFIG) return failed("struct");
+  return 0;
+}
+
+/* Issue #15: DPoP, acr, PAR required, the ID token algorithms, typ and at_hash,
+   one set of rules for every way of creating a client, and the session cache. */
+
+static iya_oidc_rp *rp_from(iya_test_provider *stub, const char *overrides, iya_oidc_error *err) {
+  char *cfg = iya_test_provider_config(stub, overrides);
+  iya_oidc_rp *rp = NULL;
+  memset(err, 0, sizeof *err);
+  int rc = iya_oidc_create(cfg, &rp, err);
+  iya_oidc_string_free(cfg);
+  return rc == IYA_OIDC_OK ? rp : NULL;
+}
+
+static int sign_in_with(iya_oidc_rp *rp, const char *acr, const char *session_id, iya_oidc_login **login,
+                        iya_oidc_txn **txn_out, iya_oidc_error *err) {
+  iya_oidc_txn *txn = NULL;
+  memset(err, 0, sizeof *err);
+  int rc = iya_oidc_authorize_with(rp, NULL, NULL, acr, &txn, err);
+  if (rc != IYA_OIDC_OK) return rc;
+  int status = 0;
+  char location[8192];
+  location[0] = '\0';
+  if (iya_test_manual(iya_oidc_txn_url(txn), &status, location, sizeof location) != 0 || location[0] == '\0') {
+    snprintf(err->message, sizeof err->message, "the provider did not redirect (%d)", status);
+    iya_oidc_txn_free(txn);
+    return IYA_OIDC_ERR_PROTOCOL;
+  }
+  Pair query[16];
+  int n = query_of(location, query, 16);
+  const char *keys[16];
+  const char *vals[16];
+  for (int i = 0; i < n; i++) {
+    keys[i] = query[i].key;
+    vals[i] = query[i].val;
+  }
+  rc = iya_oidc_complete_session(rp, keys, vals, (size_t)n, txn, session_id, login, err);
+  if (txn_out) *txn_out = txn;
+  else iya_oidc_txn_free(txn);
+  return rc;
+}
+
+static int expect_refused(int rc, const iya_oidc_error *err, const char *part) {
+  if (rc == IYA_OIDC_OK) {
+    fprintf(stderr, "FAIL: accepted, expected a refusal naming %s\n", part);
+    return 1;
+  }
+  if (!contains(err->message, part)) {
+    fprintf(stderr, "FAIL: refusal \"%s\" does not name %s\n", err->message, part);
+    return 1;
+  }
+  return 0;
+}
+
+int TestDPoPProofsOnEveryRequest(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_test_provider_set_dpop(stub, 1);
+  iya_test_provider_set_par(stub, 1);
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  if (iya_oidc_dpop(rp) != 1) return failed("dpop auto did not turn on");
+  char jkt[128];
+  snprintf(jkt, sizeof jkt, "%s", iya_oidc_dpop_jkt(rp));
+  if (strlen(jkt) != 43) return failed(jkt);
+  iya_oidc_login *login = NULL;
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "par.proof"), "valid") != 0) return failed(iya_test_provider_note(stub, "par.proof"));
+  if (strcmp(iya_test_provider_note(stub, "par.dpop_jkt"), jkt) != 0) return failed("dpop_jkt in the PAR body");
+  if (strcmp(iya_test_provider_note(stub, "authorize.pushed"), "yes") != 0) return failed("pushed");
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.proof"), "valid") != 0)
+    return failed(iya_test_provider_note(stub, "token.authorization_code.proof"));
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.jkt"), jkt) != 0) return failed("token jkt");
+  if (strcmp(iya_oidc_login_token_type(login), "DPoP") != 0) return failed(iya_oidc_login_token_type(login));
+  char *sub = NULL;
+  if (iya_oidc_userinfo(rp, iya_oidc_login_access_token(login), "user-1", &sub, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  iya_oidc_string_free(sub);
+  if (strcmp(iya_test_provider_note(stub, "userinfo.scheme"), "DPoP") != 0) return failed("userinfo scheme");
+  if (strcmp(iya_test_provider_note(stub, "userinfo.proof"), "valid") != 0)
+    return failed(iya_test_provider_note(stub, "userinfo.proof"));
+  /* htu leaves out the query and the fragment. */
+  char url[512];
+  snprintf(url, sizeof url, "%s/userinfo?x=1#frag", iya_test_provider_url(stub));
+  int status = 0;
+  char *body = NULL;
+  if (iya_oidc_resource_request(rp, "GET", url, iya_oidc_login_access_token(login), NULL, NULL, &status, &body, &err) !=
+      IYA_OIDC_OK)
+    return failed(err.message);
+  if (status != 200 || !contains(body, "user-1")) return failed(body);
+  iya_oidc_string_free(body);
+  iya_oidc_login *refreshed = NULL;
+  if (iya_oidc_refresh(rp, iya_oidc_login_refresh_token(login), "", login, &refreshed, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.refresh_token.proof"), "valid") != 0) return failed("refresh proof");
+  if (strcmp(iya_oidc_login_token_type(refreshed), "DPoP") != 0) return failed("refresh token_type");
+  char *cc = NULL;
+  if (iya_oidc_client_credentials(rp, "ssf.manage", &cc, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.client_credentials.proof"), "valid") != 0) return failed("cc proof");
+  iya_oidc_string_free(cc);
+  iya_oidc_login_free(refreshed);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  /* Without PAR, dpop_jkt is on the authorization URL. */
+  iya_test_provider_set_par(stub, 0);
+  rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_txn *txn = NULL;
+  if (sign_in_with(rp, NULL, NULL, &login, &txn, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (!contains(iya_oidc_txn_url(txn), "dpop_jkt=")) return failed(iya_oidc_txn_url(txn));
+  if (strcmp(iya_test_provider_note(stub, "authorize.dpop_jkt"), iya_oidc_dpop_jkt(rp)) != 0) return failed("url jkt");
+  iya_oidc_txn_free(txn);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+static char *p256_pem(void) {
+  EVP_PKEY *key = EVP_EC_gen("P-256");
+  BIO *bio = BIO_new(BIO_s_mem());
+  PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL);
+  char *data = NULL;
+  long len = BIO_get_mem_data(bio, &data);
+  char *out = malloc((size_t)len + 1);
+  memcpy(out, data, (size_t)len);
+  out[len] = '\0';
+  BIO_free(bio);
+  EVP_PKEY_free(key);
+  return out;
+}
+
+static void json_escape(const char *in, char *out, size_t n) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 3 < n; i++) {
+    if (in[i] == '\n') {
+      out[o++] = '\\';
+      out[o++] = 'n';
+    } else {
+      out[o++] = in[i];
+    }
+  }
+  out[o] = '\0';
+}
+
+int TestDPoPModes(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_oidc_error err;
+  /* auto with nothing advertised: no proofs, Bearer tokens. */
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp || iya_oidc_dpop(rp) != 0 || iya_oidc_dpop_jkt(rp)[0]) return failed("auto without metadata");
+  iya_oidc_login *login = NULL;
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.proof"), "none") != 0) return failed("proof sent");
+  if (strcmp(iya_oidc_login_token_type(login), "Bearer") != 0) return failed("Bearer");
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  /* always fails at creation when the provider advertises nothing, or no ES256. */
+  if (rp_from(stub, "{\"dpop\":\"always\"}", &err) || expect_refused(1, &err, "dpop_signing_alg_values_supported"))
+    return failed("always without metadata");
+  iya_test_provider_set_dpop(stub, 2);
+  if (rp_from(stub, "{\"dpop\":\"always\"}", &err) || expect_refused(1, &err, "ES256")) return failed("always without ES256");
+  rp = rp_from(stub, NULL, &err);
+  if (!rp || iya_oidc_dpop(rp) != 0) return failed("auto without ES256");
+  iya_oidc_rp_free(rp);
+  /* never sends no proofs even when the provider offers DPoP. */
+  iya_test_provider_set_dpop(stub, 1);
+  rp = rp_from(stub, "{\"dpop\":\"never\"}", &err);
+  if (!rp || iya_oidc_dpop(rp) != 0) return failed("never");
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.proof"), "none") != 0) return failed("never proofed");
+  if (iya_test_provider_note(stub, "authorize.dpop_jkt")[0] != '\0') return failed("never sent dpop_jkt");
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  rp = rp_from(stub, "{\"dpop\":\"always\"}", &err);
+  if (!rp || iya_oidc_dpop(rp) != 1) return failed(err.message);
+  iya_oidc_rp_free(rp);
+  if (rp_from(stub, "{\"dpop\":\"sometimes\"}", &err) || err.code != IYA_OIDC_ERR_CONFIG ||
+      !contains(err.message, "dpop must be auto, always, or never"))
+    return failed(err.message);
+  /* dpopKey names a key the application keeps; two clients with it share a thumbprint. */
+  char *pem = p256_pem();
+  char escaped[2048];
+  json_escape(pem, escaped, sizeof escaped);
+  char over[2400];
+  snprintf(over, sizeof over, "{\"dpopKey\":\"%s\"}", escaped);
+  iya_oidc_rp *one = rp_from(stub, over, &err);
+  if (!one) return failed(err.message);
+  iya_oidc_rp *two = rp_from(stub, over, &err);
+  if (!two) return failed(err.message);
+  char first[128];
+  snprintf(first, sizeof first, "%s", iya_oidc_dpop_jkt(one));
+  if (strcmp(first, iya_oidc_dpop_jkt(two)) != 0) return failed("dpopKey thumbprints differ");
+  rp = rp_from(stub, NULL, &err);
+  if (!rp || strcmp(first, iya_oidc_dpop_jkt(rp)) == 0) return failed("a generated key equals dpopKey");
+  if (sign_in_with(one, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.jkt"), first) != 0) return failed("dpopKey jkt");
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_oidc_rp_free(one);
+  iya_oidc_rp_free(two);
+  free(pem);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+typedef struct {
+  int ended;
+} EndCount;
+
+static void count_end(const char **ids, size_t count, void *user) {
+  (void)ids;
+  ((EndCount *)user)->ended += (int)count;
+}
+
+int TestDPoPNonceAndTransmitterCalls(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_test_provider_set_dpop(stub, 1);
+  iya_test_provider_set_dpop_nonce(stub, 1);
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  if (sign_in_with(rp, NULL, "L-a1", &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.authorization_code.nonce_challenges"), "1") != 0)
+    return failed("one use_dpop_nonce answer, then the retry");
+  if (iya_test_provider_note(stub, "token.authorization_code.nonce")[0] == '\0') return failed("nonce in the proof");
+  iya_oidc_login *refreshed = NULL;
+  if (iya_oidc_refresh(rp, iya_oidc_login_refresh_token(login), "", login, &refreshed, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  if (iya_test_provider_note(stub, "token.refresh_token.nonce_challenges")[0] != '\0')
+    return failed("the remembered nonce was not sent");
+  iya_oidc_login_free(refreshed);
+  /* The SSF transmitter: a DPoP-bound client-credentials token, a proof with ath on
+     every call, and a 401 use_dpop_nonce answered once. */
+  iya_test_tx *tx = iya_test_tx_start();
+  iya_test_tx_set_dpop_nonce(tx, 1);
+  EndCount ends = {0};
+  iya_oidc_receiver *rx = NULL;
+  if (iya_oidc_receiver_new_for_rp(iya_test_tx_url(tx), count_end, &ends, rp, NULL, &rx, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  if (iya_oidc_receiver_start(rx, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_receiver_stop(rx);
+  if (iya_test_tx_created(tx) != 1) return failed("stream not created");
+  if (iya_test_tx_dpop_challenges(tx) != 1) return failed("transmitter nonce challenge");
+  if (iya_test_tx_dpop_proofs(tx) < 2) return failed("transmitter proofs");
+  if (!contains(iya_test_tx_authorization(tx), "DPoP cc-token")) return failed(iya_test_tx_authorization(tx));
+  /* A session-revoked for a tracked session also clears its cache entry. */
+  if (iya_oidc_receiver_track(rx, "L-a1", "user-1", "user-1@example.com", "IDP-1", &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  char *token = NULL;
+  if (iya_oidc_session_access_token(rp, "L-a1", &token, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_string_free(token);
+  char sub[512];
+  snprintf(sub, sizeof sub,
+           "{\"format\":\"complex\",\"user\":{\"format\":\"iss_sub\",\"iss\":\"%s\",\"sub\":\"user-1\"},"
+           "\"session\":{\"format\":\"opaque\",\"id\":\"IDP-1\"}}",
+           iya_test_tx_url(tx));
+  iya_oidc_string_free(iya_test_tx_deliver(tx, iya_oidc_event_type("sessionRevoked"), sub, NULL, 0));
+  int more = 0;
+  if (iya_oidc_receiver_poll_once(rx, &more, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (ends.ended != 1) return failed("session-revoked did not end L-a1");
+  memset(&err, 0, sizeof err);
+  if (expect_refused(iya_oidc_session_access_token(rp, "L-a1", &token, NULL, &err), &err, "no signed-in session"))
+    return 1;
+  iya_oidc_receiver_free(rx);
+  iya_test_tx_free(tx);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestTokenTypeMustMatchTheProof(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_test_provider_set_dpop(stub, 1);
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  iya_test_provider_set_token_type(stub, "Bearer");
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "not DPoP")) return 1;
+  iya_test_provider_set_token_type(stub, "dpop");
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  rp = rp_from(stub, "{\"dpop\":\"never\"}", &err);
+  if (!rp) return failed(err.message);
+  iya_test_provider_set_token_type(stub, "DPoP");
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "not Bearer")) return 1;
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestAcrIsEnforced(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  iya_oidc_txn *txn = NULL;
+  if (expect_refused(sign_in_with(rp, "urn:x urn:y", NULL, &login, &txn, &err), &err, "no acr")) return 1;
+  if (strcmp(iya_oidc_txn_acr_values(txn), "urn:x urn:y") != 0) return failed("acr_values kept in the transaction");
+  if (strcmp(iya_test_provider_note(stub, "authorize.acr_values"), "urn:x urn:y") != 0) return failed("acr_values sent");
+  iya_oidc_txn_free(txn);
+  iya_test_provider_set_acr(stub, "urn:z");
+  if (expect_refused(sign_in_with(rp, "urn:x urn:y", NULL, &login, NULL, &err), &err, "not one of the requested"))
+    return 1;
+  iya_test_provider_set_acr(stub, "urn:y");
+  if (sign_in_with(rp, "urn:x urn:y", NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_oidc_login_acr(login), "urn:y") != 0) return failed("acr");
+  /* The refresh path does not check acr again. */
+  iya_test_provider_set_acr(stub, "");
+  iya_oidc_login *refreshed = NULL;
+  if (iya_oidc_refresh(rp, iya_oidc_login_refresh_token(login), "", login, &refreshed, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  iya_oidc_login_free(refreshed);
+  iya_oidc_login_free(login);
+  /* Not requested: no acr is fine. */
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  /* The setting, as a list. */
+  rp = rp_from(stub, "{\"acrValues\":[\"urn:gold\"]}", &err);
+  if (!rp) return failed(err.message);
+  iya_test_provider_set_acr(stub, "urn:silver");
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "not one of the requested")) return 1;
+  iya_test_provider_set_acr(stub, "urn:gold");
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestPARRequiredByTheProvider(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_test_provider_set_require_par(stub, 1);
+  iya_oidc_error err;
+  if (rp_from(stub, NULL, &err) || expect_refused(1, &err, "pushed_authorization_request_endpoint"))
+    return failed("required without an endpoint");
+  iya_test_provider_set_par(stub, 1);
+  if (rp_from(stub, "{\"par\":\"never\"}", &err) || expect_refused(1, &err, "par is never"))
+    return failed("par never while required");
+  char *meta = iya_test_provider_metadata(stub);
+  if (!kind_is(meta, "require_pushed_authorization_requests", 3)) return failed(meta);
+  iya_oidc_string_free(meta);
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  iya_oidc_txn *txn = NULL;
+  if (sign_in_with(rp, NULL, NULL, &login, &txn, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (!contains(iya_oidc_txn_url(txn), "request_uri=") || contains(iya_oidc_txn_url(txn), "code_challenge"))
+    return failed(iya_oidc_txn_url(txn));
+  iya_oidc_txn_free(txn);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestIdTokenAlgorithms(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_oidc_error err;
+  memset(&err, 0, sizeof err);
+  char *resolved = NULL;
+  if (iya_oidc_resolve_config("{\"metadataUrl\":\"https://localhost:8081/.well-known/openid-configuration\","
+                              "\"client_id\":\"c\",\"clientSecret\":\"s\",\"redirectUri\":\"http://localhost:3000/cb\"}",
+                              "/tmp", &resolved, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  if (!text_is(resolved, "idTokenSigningAlgs", "[\"RS256\"]") || !text_is(resolved, "dpop", "auto") ||
+      !text_is(resolved, "par", "auto") || !kind_is(resolved, "requireIdTokenTypAndAtHash", 3) ||
+      !text_is(resolved, "clockToleranceSec", "30") || !text_is(resolved, "maxIdTokenAgeSec", "600"))
+    return failed(resolved);
+  iya_oidc_string_free(resolved);
+  /* RS256 only by default: a provider that does not advertise it cannot be used. */
+  iya_test_provider_set_algs(stub, "[\"ES256\",\"PS256\"]");
+  if (rp_from(stub, NULL, &err) || expect_refused(1, &err, "none of the accepted ID token algorithms (RS256)"))
+    return failed("RS256 not advertised");
+  /* The list is narrowed to what the provider advertises; empty fails, and a pin
+     the provider does not advertise fails. */
+  iya_test_provider_set_algs(stub, "[\"RS256\",\"HS256\"]");
+  iya_oidc_rp *narrowed = rp_from(stub, "{\"idTokenSigningAlgs\":[\"RS256\",\"ES256\"]}", &err);
+  if (!narrowed) return failed(err.message);
+  iya_oidc_login *ok_login = NULL;
+  if (sign_in_with(narrowed, NULL, NULL, &ok_login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(ok_login);
+  iya_oidc_rp_free(narrowed);
+  if (rp_from(stub, "{\"idTokenSigningAlgs\":[\"ES256\",\"PS256\"]}", &err) ||
+      expect_refused(1, &err, "none of the accepted ID token algorithms"))
+    return failed("nothing left");
+  if (rp_from(stub, "{\"idTokenSignedResponseAlg\":\"ES256\"}", &err) ||
+      expect_refused(1, &err, "does not advertise id_token alg ES256"))
+    return failed("pinned ES256");
+  /* none is never accepted, as the list or as the pin. */
+  if (rp_from(stub, "{\"idTokenSigningAlgs\":[\"none\"]}", &err) || expect_refused(1, &err, "none is never accepted"))
+    return failed("none listed");
+  if (rp_from(stub, "{\"idTokenSignedResponseAlg\":\"none\"}", &err) || expect_refused(1, &err, "none is never accepted"))
+    return failed("none pinned");
+  /* A symmetric algorithm only when named; RS256 tokens are then refused. */
+  iya_oidc_rp *rp = rp_from(stub, "{\"idTokenSigningAlgs\":[\"HS256\"]}", &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "signed with RS256")) return 1;
+  iya_oidc_rp_free(rp);
+  /* The default accepts the provider's RS256 tokens although HS256 is advertised. */
+  rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  rp = rp_from(stub, "{\"idTokenSigningAlgs\":[\"HS256\",\"RS256\"],\"idTokenSignedResponseAlg\":\"RS256\"}", &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestTypAndAtHashAreRequired(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  iya_test_provider_set_omit(stub, 1);
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "typ")) return 1;
+  iya_test_provider_set_omit(stub, 2);
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "no at_hash")) return 1;
+  iya_oidc_rp_free(rp);
+  rp = rp_from(stub, "{\"requireIdTokenTypAndAtHash\":false}", &err);
+  if (!rp) return failed(err.message);
+  iya_test_provider_set_omit(stub, 3);
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  /* Relaxed still checks them when present. */
+  iya_test_provider_set_bad_at_hash(stub, 1);
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "at_hash")) return 1;
+  iya_oidc_rp_free(rp);
+  if (rp_from(stub, "{\"requireIdTokenTypAndAtHash\":\"yes\"}", &err) ||
+      expect_refused(1, &err, "requireIdTokenTypAndAtHash must be true or false"))
+    return failed("setting type");
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+int TestCreateAppliesTheSameRules(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_oidc_error err;
+  /* No defaults in the configuration: iya_oidc_create supplies them. */
+  const char *bare = "{\"par\":null,\"clockToleranceSec\":null,\"maxIdTokenAgeSec\":null,\"privateKeyAlg\":null}";
+  iya_oidc_rp *rp = rp_from(stub, bare, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  iya_test_provider_set_iat_offset(stub, 20);
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_test_provider_set_iat_offset(stub, 120);
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "iat is in the future")) return 1;
+  iya_test_provider_set_exp(stub, (long long)time(NULL) - 1200);
+  if (expect_refused(sign_in_with(rp, NULL, NULL, &login, NULL, &err), &err, "exp")) return 1;
+  /* A per-request redirect URI is held to the rule. */
+  iya_oidc_txn *txn = NULL;
+  memset(&err, 0, sizeof err);
+  if (expect_refused(iya_oidc_authorize_with(rp, "http://app.example/cb", NULL, NULL, &txn, &err), &err,
+                     "must use https"))
+    return 1;
+  if (iya_oidc_authorize_with(rp, "http://[::1]:8080/cb", NULL, NULL, &txn, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (!contains(iya_oidc_txn_url(txn), "8080")) return failed(iya_oidc_txn_url(txn));
+  iya_oidc_txn_free(txn);
+  if (iya_oidc_authorize_with(rp, "https://app.example/cb", NULL, NULL, &txn, &err) != IYA_OIDC_OK)
+    return failed(err.message);
+  iya_oidc_txn_free(txn);
+  iya_oidc_rp_free(rp);
+  /* The configured redirect URI too, allowInsecure or not. */
+  if (rp_from(stub, "{\"redirectUri\":\"http://app.example/cb\"}", &err) || expect_refused(1, &err, "must use https"))
+    return failed("http redirect");
+  rp = rp_from(stub, "{\"redirectUri\":\"http://localhost:3000/cb\"}", &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_rp_free(rp);
+  /* Embedded metadata is validated like discovered metadata. */
+  if (rp_from(stub, "{\"metadataUrl\":null,\"metadata\":{\"issuer\":\"https://op.example\"}}", &err) ||
+      expect_refused(1, &err, "metadata is missing"))
+    return failed("embedded metadata");
+  char *meta = iya_test_provider_metadata(stub);
+  char over[8192];
+  snprintf(over, sizeof over, "{\"metadataUrl\":null,\"metadata\":%s}", meta);
+  iya_oidc_string_free(meta);
+  rp = rp_from(stub, over, &err);
+  if (!rp) return failed(err.message);
+  if (sign_in_with(rp, NULL, NULL, &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
+  return 0;
+}
+
+/* A store an application supplies, here an array of eight entries. */
+typedef struct {
+  pthread_mutex_t mu;
+  char ids[8][64];
+  char *docs[8];
+  int puts;
+  int removes;
+} CStore;
+
+static int store_get(void *user, const char *id, char **out) {
+  CStore *st = user;
+  int found = 0;
+  pthread_mutex_lock(&st->mu);
+  for (int i = 0; i < 8; i++) {
+    if (st->docs[i] && strcmp(st->ids[i], id) == 0) {
+      *out = strdup(st->docs[i]);
+      found = 1;
+    }
+  }
+  pthread_mutex_unlock(&st->mu);
+  return found;
+}
+
+static void store_put(void *user, const char *id, const char *doc) {
+  CStore *st = user;
+  pthread_mutex_lock(&st->mu);
+  st->puts++;
+  int slot = -1;
+  for (int i = 0; i < 8; i++)
+    if (st->docs[i] && strcmp(st->ids[i], id) == 0) slot = i;
+  for (int i = 0; i < 8 && slot < 0; i++)
+    if (!st->docs[i]) slot = i;
+  if (slot >= 0) {
+    free(st->docs[slot]);
+    snprintf(st->ids[slot], sizeof st->ids[slot], "%s", id);
+    st->docs[slot] = strdup(doc);
+  }
+  pthread_mutex_unlock(&st->mu);
+}
+
+static void store_remove(void *user, const char *id) {
+  CStore *st = user;
+  pthread_mutex_lock(&st->mu);
+  st->removes++;
+  for (int i = 0; i < 8; i++) {
+    if (st->docs[i] && strcmp(st->ids[i], id) == 0) {
+      free(st->docs[i]);
+      st->docs[i] = NULL;
+    }
+  }
+  pthread_mutex_unlock(&st->mu);
+}
+
+int TestSessionTokenCache(void) {
+  iya_test_provider *stub = iya_test_provider_start();
+  iya_test_provider_set_dpop(stub, 1);
+  iya_oidc_error err;
+  iya_oidc_rp *rp = rp_from(stub, NULL, &err);
+  if (!rp) return failed(err.message);
+  iya_oidc_login *login = NULL;
+  if (sign_in_with(rp, NULL, "S1", &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_oidc_login_session_id(login), "S1") != 0) return failed("session id");
+  char *token = NULL;
+  char *type = NULL;
+  if (iya_oidc_session_access_token(rp, "S1", &token, &type, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(token, iya_oidc_login_access_token(login)) != 0 || strcmp(type, "DPoP") != 0)
+    return failed("the cached token was not returned");
+  iya_oidc_string_free(token);
+  iya_oidc_string_free(type);
+  iya_oidc_login_free(login);
+  /* 30 seconds or less left: refreshed, with a DPoP proof, and cached. */
+  iya_test_provider_set_expires_in(stub, 20);
+  if (sign_in_with(rp, NULL, "S2", &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (iya_oidc_session_access_token(rp, "S2", &token, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(token, iya_oidc_login_access_token(login)) == 0) return failed("not refreshed");
+  if (strcmp(iya_test_provider_note(stub, "token.refresh_token.proof"), "valid") != 0) return failed("refresh proof");
+  if (strcmp(iya_test_provider_note(stub, "token.refresh_token.issued"), "1") != 0) return failed("one refresh");
+  iya_test_provider_set_expires_in(stub, 300);
+  char *again = NULL;
+  if (iya_oidc_session_access_token(rp, "S2", &again, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(iya_test_provider_note(stub, "token.refresh_token.issued"), "2") != 0) return failed("second refresh");
+  char *cached = NULL;
+  if (iya_oidc_session_access_token(rp, "S2", &cached, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(cached, again) != 0 || strcmp(iya_test_provider_note(stub, "token.refresh_token.issued"), "2") != 0)
+    return failed("the refreshed token was not cached");
+  iya_oidc_string_free(token);
+  iya_oidc_string_free(again);
+  iya_oidc_string_free(cached);
+  iya_oidc_login_free(login);
+  /* A handle the library chose. */
+  memset(&err, 0, sizeof err);
+  iya_oidc_txn *txn = NULL;
+  if (iya_oidc_authorize(rp, &txn, &err) != IYA_OIDC_OK) return failed(err.message);
+  int status = 0;
+  char location[8192];
+  if (iya_test_manual(iya_oidc_txn_url(txn), &status, location, sizeof location) != 0) return failed("manual");
+  Pair query[16];
+  int n = query_of(location, query, 16);
+  if (complete_pairs(rp, query, n, txn, &login, &err) != IYA_OIDC_OK) return failed(err.message);
+  char handle[128];
+  snprintf(handle, sizeof handle, "%s", iya_oidc_login_session_id(login));
+  if (strlen(handle) < 20) return failed("no handle");
+  if (iya_oidc_session_access_token(rp, handle, &token, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_string_free(token);
+  iya_oidc_txn_free(txn);
+  iya_oidc_login_free(login);
+  /* Sign-out removes the entry. */
+  iya_oidc_session_remove(rp, "S1");
+  if (expect_refused(iya_oidc_session_access_token(rp, "S1", &token, NULL, &err), &err, "no signed-in session")) return 1;
+  /* A failed refresh removes the entry and is refused. */
+  iya_test_provider_set_expires_in(stub, 5);
+  if (sign_in_with(rp, NULL, "S3", &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  iya_test_provider_revoke_refresh(stub);
+  memset(&err, 0, sizeof err);
+  if (iya_oidc_session_access_token(rp, "S3", &token, NULL, &err) == IYA_OIDC_OK ||
+      strcmp(err.oauth_error, "invalid_grant") != 0)
+    return failed(err.message);
+  if (expect_refused(iya_oidc_session_access_token(rp, "S3", &token, NULL, &err), &err, "no signed-in session")) return 1;
+  /* A store the application supplies. */
+  iya_test_provider_set_expires_in(stub, 300);
+  CStore store;
+  memset(&store, 0, sizeof store);
+  pthread_mutex_init(&store.mu, NULL);
+  iya_oidc_session_store hooks = {&store, store_get, store_put, store_remove};
+  if (iya_oidc_set_session_store(rp, &hooks, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (sign_in_with(rp, NULL, "C1", &login, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (store.puts != 1 || !store.docs[0] || !contains(store.docs[0], "\"access_token\"") ||
+      !contains(store.docs[0], "\"refresh_token\""))
+    return failed("put");
+  if (iya_oidc_session_access_token(rp, "C1", &token, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  if (strcmp(token, iya_oidc_login_access_token(login)) != 0) return failed("get");
+  iya_oidc_string_free(token);
+  iya_oidc_session_remove(rp, "C1");
+  if (store.removes != 1 || store.docs[0]) return failed("remove");
+  iya_oidc_session_store partial = {&store, store_get, NULL, store_remove};
+  if (iya_oidc_set_session_store(rp, &partial, &err) == IYA_OIDC_OK) return failed("partial store accepted");
+  if (iya_oidc_set_session_store(rp, NULL, &err) != IYA_OIDC_OK) return failed(err.message);
+  iya_oidc_login_free(login);
+  pthread_mutex_destroy(&store.mu);
+  iya_oidc_rp_free(rp);
+  iya_test_provider_free(stub);
   return 0;
 }

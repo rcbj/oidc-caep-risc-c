@@ -10,6 +10,12 @@ The license is the MIT License in `LICENSE`. The library is a CMake package: `fi
 
 Cryptography is OpenSSL from the Debian packages (`libssl` and `libcrypto`). HTTP/1.1 and JSON are in this repository. No curl, no JSON library, no OAuth library, and no Boost.
 
+## Client profile (#15)
+
+`RelyingParty::Create` (and `iya_oidc_create`) resolves the configuration like `FromFile`, so the defaults (`par` and `dpop` auto, `clockToleranceSec` 30, `maxIdTokenAgeSec` 600, `idTokenSigningAlgs` `["RS256"]`, `requireIdTokenTypAndAtHash` true), the redirect rule (https, or http on a loopback host; `allowInsecure` does not widen it, also for a per-request redirect URI) and the metadata checks (an inline `metadata` object too) apply to both. Resolving is idempotent (`privateKeyPem`, `dpopKeyPem` and `metadata` in a resolved configuration are read back).
+
+DPoP is in `src/rp.cpp` (`Impl::Proof`, `PostForm`, `Resource`): an ES256 key generated per relying party or `dpopKey`, a proof on PAR, token (every grant) and resource requests (`ath`), `dpop_jkt` on the authorization request, one retry per `use_dpop_nonce`, nonces kept per origin, `token_type` DPoP exactly when a proof was sent. `auto` turns on only when ES256 is advertised. The SSF receiver gets per-request headers and a retry decision through `SignalsReceiver::Options::request_headers` and `on_response`; `SignalsOptionsFor(rp)` and `iya_oidc_receiver_new_for_rp` fill them. ID token algorithms: the list narrowed to the provider's, failing only when empty; a pin must be advertised. `acr` is checked on the code exchange only. The session token cache is `SessionStore` (default `MemorySessionStore`; C: `iya_oidc_session_store`, entries as JSON); `SessionAccessToken` refreshes at 30 seconds left, and a failed refresh removes the entry. The stub provider (`tests/stub.cpp`) checks DPoP proofs itself (its RFC 7638 thumbprint is written out, not the library's) and records what it saw in notes (`iya_test_provider_note`).
+
 ## Layout
 
 | Path | What it is |
@@ -44,7 +50,7 @@ The `test` stage is a sibling of the demo build. It runs `ctest` in Debian bookw
 
 `python3 scripts/live_iya_sts.py` (host stdlib python3 and Docker; never CMake or a compiler on the host) starts a fresh iya-sts `main` in memory mode as container `iya-sts-live-oidc-caep-risc-c` on `LIVE_STS_PORT` (default 18528), copies the checkout to a scratch build context, builds the demo image, runs `scripts/configure_iya_sts.py` on the host against that copy (which writes the trust chain), rebuilds the image (which bakes the chain in), checks the image's chain equals the saved one, runs `oidc-caep-risc-c-live-demo` with `--network host` on `LIVE_DEMO_PORT` (default 18628) mounting only `client-secret` and with `TLS_CA_REFRESH=0`, signs in through `/authn-api`, emits `credential-change` then `session-revoked`, and checks `GET /live-status`. `IYA_STS_URL` and `IYA_STS_IMAGE` select an existing iya-sts or image. It never binds 3000, 8081 or 18481-18495. Always against a fresh iya-sts. Secrets reach `docker run` as `-e NAME` and are never printed. `.github/workflows/nightly.yml` runs the unit image and the live script at 07:50 UTC (`50 7 * * *`).
 
-`/live-status` is `{signedIn, subject, receiver, events: [{type, jti}]}`, never tokens. A `session-revoked` that matched no tracked session ends the demo's one local session (`RememberLiveEvent` in `demo/main.cpp`, not the library).
+`/live-status` is `{signedIn, subject, receiver, events: [{type, jti}]}`, never tokens. The demo completes a sign-in under its session cookie's id, reads the access token from the session cache on `GET /` and calls UserInfo with it (DPoP when bound), removes the cache entry at sign-out and when a CAEP event ends the session, and builds its receiver with `SignalsOptionsFor`. `scripts/configure_iya_sts.py` registers the client with `oauthIdTokenSignedResponseAlg: RS256` (iya-sts's name for `id_token_signed_response_alg`). A `session-revoked` that matched no tracked session ends the demo's one local session (`RememberLiveEvent` in `demo/main.cpp`, not the library).
 
 ## tlsCa, the iya-sts trust chain
 

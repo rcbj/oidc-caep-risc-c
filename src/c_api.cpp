@@ -6,11 +6,14 @@
 #include "iya/oidc.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "json.hpp"
 
 namespace {
 
@@ -53,6 +56,64 @@ char *Dup(const std::string &s) {
 
 struct RpWrap {
   std::unique_ptr<iya::RelyingParty> rp;
+  std::string jkt;
+};
+
+std::string Str(const char *s) { return s ? s : ""; }
+
+// A C session store behind the C++ interface; entries cross as JSON.
+class CSessionStore : public iya::SessionStore {
+ public:
+  explicit CSessionStore(const iya_oidc_session_store &c) : c_(c) {}
+
+  bool Get(const std::string &id, iya::SessionTokens &out) override {
+    if (!c_.get) return false;
+    char *raw = nullptr;
+    if (c_.get(c_.user, id.c_str(), &raw) != 1 || !raw) {
+      std::free(raw);
+      return false;
+    }
+    std::string text = raw;
+    std::free(raw);
+    iya::J doc;
+    try {
+      doc = iya::Parse(text);
+    } catch (const std::exception &) {
+      return false;
+    }
+    if (doc.type != iya::JType::Object) return false;
+    out.access_token = iya::Sprint(doc.find("access_token"));
+    out.token_type = iya::Sprint(doc.find("token_type"));
+    out.refresh_token = iya::Sprint(doc.find("refresh_token"));
+    out.id_token = iya::Sprint(doc.find("id_token"));
+    out.scope = iya::Sprint(doc.find("scope"));
+    out.subject = iya::Sprint(doc.find("subject"));
+    out.claims_json = iya::Sprint(doc.find("claims_json"));
+    out.has_expires = iya::AsFloat(doc.find("expires_at"), out.expires_at);
+    return true;
+  }
+
+  void Put(const std::string &id, const iya::SessionTokens &tokens) override {
+    if (!c_.put) return;
+    iya::J doc = iya::J::obj();
+    doc.set("access_token", iya::J::str(tokens.access_token));
+    doc.set("token_type", iya::J::str(tokens.token_type));
+    doc.set("refresh_token", iya::J::str(tokens.refresh_token));
+    doc.set("id_token", iya::J::str(tokens.id_token));
+    doc.set("scope", iya::J::str(tokens.scope));
+    doc.set("subject", iya::J::str(tokens.subject));
+    doc.set("claims_json", iya::J::str(tokens.claims_json));
+    if (tokens.has_expires) doc.set("expires_at", iya::J::floating(tokens.expires_at));
+    std::string text = iya::Stringify(doc);
+    c_.put(c_.user, id.c_str(), text.c_str());
+  }
+
+  void Remove(const std::string &id) override {
+    if (c_.remove) c_.remove(c_.user, id.c_str());
+  }
+
+ private:
+  iya_oidc_session_store c_;
 };
 
 struct TxnWrap {
@@ -70,6 +131,7 @@ struct EventSink {
 
 struct RxWrap {
   std::unique_ptr<iya::SignalsReceiver> rx;
+  iya::RelyingParty *rp = nullptr;
   std::string stream_id;
   iya_oidc_on_end_fn on_end = nullptr;
   void *on_end_user = nullptr;
@@ -212,6 +274,32 @@ int iya_oidc_authorize(iya_oidc_rp *rp, iya_oidc_txn **out, iya_oidc_error *err)
   }
 }
 
+int iya_oidc_authorize_with(iya_oidc_rp *rp, const char *redirect_uri, const char *scope, const char *acr_values,
+                            iya_oidc_txn **out, iya_oidc_error *err) {
+  try {
+    auto *wrap = reinterpret_cast<RpWrap *>(rp);
+    if (!wrap || !wrap->rp) {
+      iya::OidcError e("config", "relying party is null");
+      return FailOidc(err, e);
+    }
+    iya::AuthorizeOptions opts;
+    opts.redirect_uri = Str(redirect_uri);
+    opts.scope = Str(scope);
+    opts.acr_values = Str(acr_values);
+    iya::Transaction txn = wrap->rp->Authorize(opts);
+    if (out) {
+      auto *held = new TxnWrap();
+      held->txn = std::move(txn);
+      *out = reinterpret_cast<iya_oidc_txn *>(held);
+    }
+    return IYA_OIDC_OK;
+  } catch (const iya::OidcError &e) {
+    return FailOidc(err, e);
+  } catch (const std::exception &e) {
+    return FailOther(err, e);
+  }
+}
+
 iya_oidc_txn *iya_oidc_txn_clone(const iya_oidc_txn *txn) {
   if (!txn) return nullptr;
   auto *src = reinterpret_cast<const TxnWrap *>(txn);
@@ -240,10 +328,21 @@ const char *iya_oidc_txn_state(const iya_oidc_txn *txn) {
   return reinterpret_cast<const TxnWrap *>(txn)->txn.state.c_str();
 }
 
+const char *iya_oidc_txn_acr_values(const iya_oidc_txn *txn) {
+  if (!txn) return "";
+  return reinterpret_cast<const TxnWrap *>(txn)->txn.acr_values.c_str();
+}
+
 void iya_oidc_txn_free(iya_oidc_txn *txn) { delete reinterpret_cast<TxnWrap *>(txn); }
 
 int iya_oidc_complete(iya_oidc_rp *rp, const char *const *keys, const char *const *vals, size_t nquery,
                       const iya_oidc_txn *txn, iya_oidc_login **out, iya_oidc_error *err) {
+  return iya_oidc_complete_session(rp, keys, vals, nquery, txn, nullptr, out, err);
+}
+
+int iya_oidc_complete_session(iya_oidc_rp *rp, const char *const *keys, const char *const *vals, size_t nquery,
+                              const iya_oidc_txn *txn, const char *session_id, iya_oidc_login **out,
+                              iya_oidc_error *err) {
   try {
     auto *wrap = reinterpret_cast<RpWrap *>(rp);
     auto *held = reinterpret_cast<const TxnWrap *>(txn);
@@ -257,7 +356,7 @@ int iya_oidc_complete(iya_oidc_rp *rp, const char *const *keys, const char *cons
       const char *val = vals && vals[i] ? vals[i] : "";
       query[key] = val;
     }
-    iya::Login login = wrap->rp->Complete(query, held->txn);
+    iya::Login login = wrap->rp->Complete(query, held->txn, Str(session_id));
     if (out) {
       auto *box = new LoginWrap();
       box->login = std::move(login);
@@ -372,6 +471,104 @@ const char *iya_oidc_login_refresh_token(const iya_oidc_login *login) {
   return reinterpret_cast<const LoginWrap *>(login)->login.refresh_token.c_str();
 }
 
+const char *iya_oidc_login_token_type(const iya_oidc_login *login) {
+  if (!login) return "";
+  return reinterpret_cast<const LoginWrap *>(login)->login.token_type.c_str();
+}
+const char *iya_oidc_login_session_id(const iya_oidc_login *login) {
+  if (!login) return "";
+  return reinterpret_cast<const LoginWrap *>(login)->login.session_id.c_str();
+}
+const char *iya_oidc_login_acr(const iya_oidc_login *login) {
+  if (!login) return "";
+  return reinterpret_cast<const LoginWrap *>(login)->login.acr.c_str();
+}
+
+int iya_oidc_session_access_token(iya_oidc_rp *rp, const char *session_id, char **access_token, char **token_type,
+                                  iya_oidc_error *err) {
+  try {
+    auto *wrap = reinterpret_cast<RpWrap *>(rp);
+    if (!wrap || !wrap->rp) {
+      iya::OidcError e("protocol", "relying party is null");
+      return FailOidc(err, e);
+    }
+    iya::Access access = wrap->rp->SessionAccessToken(Str(session_id));
+    if (access_token) *access_token = Dup(access.access_token);
+    if (token_type) *token_type = Dup(access.token_type);
+    return IYA_OIDC_OK;
+  } catch (const iya::OidcError &e) {
+    return FailOidc(err, e);
+  } catch (const std::exception &e) {
+    return FailOther(err, e);
+  }
+}
+
+void iya_oidc_session_remove(iya_oidc_rp *rp, const char *session_id) {
+  auto *wrap = reinterpret_cast<RpWrap *>(rp);
+  if (!wrap || !wrap->rp) return;
+  try {
+    wrap->rp->RemoveSession(Str(session_id));
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "oidc: protocol: %s\n", e.what());
+  }
+}
+
+int iya_oidc_set_session_store(iya_oidc_rp *rp, const iya_oidc_session_store *store, iya_oidc_error *err) {
+  auto *wrap = reinterpret_cast<RpWrap *>(rp);
+  if (!wrap || !wrap->rp) {
+    iya::OidcError e("config", "relying party is null");
+    return FailOidc(err, e);
+  }
+  if (store && (!store->get || !store->put || !store->remove)) {
+    iya::OidcError e("config", "a session store needs get, put and remove");
+    return FailOidc(err, e);
+  }
+  if (store) wrap->rp->SetSessionStore(std::make_shared<CSessionStore>(*store));
+  else wrap->rp->SetSessionStore(nullptr);
+  return IYA_OIDC_OK;
+}
+
+int iya_oidc_resource_request(iya_oidc_rp *rp, const char *method, const char *url, const char *access_token,
+                              const char *body, const char *content_type, int *status, char **response_body,
+                              iya_oidc_error *err) {
+  try {
+    auto *wrap = reinterpret_cast<RpWrap *>(rp);
+    if (!wrap || !wrap->rp) {
+      iya::OidcError e("protocol", "relying party is null");
+      return FailOidc(err, e);
+    }
+    std::vector<std::pair<std::string, std::string>> headers = {{"accept", "application/json"}};
+    std::string payload;
+    const std::string *sent = nullptr;
+    if (body) {
+      payload = body;
+      sent = &payload;
+      headers.emplace_back("content-type", content_type && content_type[0] ? content_type : "application/json");
+    }
+    iya::ResourceResponse answer = wrap->rp->ResourceRequest(Str(method), Str(url), Str(access_token), headers, sent);
+    if (status) *status = answer.status;
+    if (response_body) *response_body = Dup(answer.body);
+    return IYA_OIDC_OK;
+  } catch (const iya::OidcError &e) {
+    return FailOidc(err, e);
+  } catch (const std::exception &e) {
+    return FailOther(err, e);
+  }
+}
+
+int iya_oidc_dpop(const iya_oidc_rp *rp) {
+  auto *wrap = reinterpret_cast<const RpWrap *>(rp);
+  if (!wrap || !wrap->rp) return 0;
+  return wrap->rp->dpop() ? 1 : 0;
+}
+
+const char *iya_oidc_dpop_jkt(const iya_oidc_rp *rp) {
+  auto *wrap = reinterpret_cast<RpWrap *>(const_cast<iya_oidc_rp *>(rp));
+  if (!wrap || !wrap->rp) return "";
+  wrap->jkt = wrap->rp->dpop_jkt();
+  return wrap->jkt.c_str();
+}
+
 void iya_oidc_login_free(iya_oidc_login *login) { delete reinterpret_cast<LoginWrap *>(login); }
 
 int iya_oidc_receiver_new(const char *transmitter, iya_oidc_on_end_fn on_end, void *user, const char *authorization,
@@ -402,6 +599,43 @@ int iya_oidc_receiver_new(const char *transmitter, iya_oidc_on_end_fn on_end, vo
   } catch (const iya::OidcError &e) {
     return FailOidc(err, e);
   } catch (const std::exception &e) {
+    return FailOther(err, e);
+  }
+}
+
+int iya_oidc_receiver_new_for_rp(const char *transmitter, iya_oidc_on_end_fn on_end, void *user, iya_oidc_rp *rp,
+                                 const char *scope, iya_oidc_receiver **out, iya_oidc_error *err) {
+  auto *party = reinterpret_cast<RpWrap *>(rp);
+  if (!party || !party->rp) {
+    iya::OidcError e("config", "relying party is null");
+    return FailOidc(err, e);
+  }
+  RxWrap *box = nullptr;
+  try {
+    box = new RxWrap();
+    box->on_end = on_end;
+    box->on_end_user = user;
+    box->rp = party->rp.get();
+    iya::SignalsReceiver::Options opts = iya::SignalsOptionsFor(*party->rp, Str(scope));
+    box->rx = iya::SignalsReceiver::New(
+        transmitter ? transmitter : "",
+        [box](const std::vector<std::string> &ids, const iya::SignalEvent &) {
+          for (const auto &id : ids) box->rp->RemoveSession(id);
+          if (!box->on_end) return;
+          std::vector<const char *> ptrs;
+          ptrs.reserve(ids.size());
+          for (const auto &id : ids) ptrs.push_back(id.c_str());
+          box->on_end(ptrs.empty() ? nullptr : ptrs.data(), ptrs.size(), box->on_end_user);
+        },
+        opts);
+    if (out) *out = reinterpret_cast<iya_oidc_receiver *>(box);
+    else delete box;
+    return IYA_OIDC_OK;
+  } catch (const iya::OidcError &e) {
+    delete box;
+    return FailOidc(err, e);
+  } catch (const std::exception &e) {
+    delete box;
     return FailOther(err, e);
   }
 }

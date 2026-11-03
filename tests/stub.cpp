@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "b64.hpp"
+#include "crypto.hpp"
 #include "http.hpp"
 #include "json.hpp"
 #include "util.hpp"
@@ -365,6 +366,117 @@ std::string RandomB64(size_t n) {
   return iya::B64URLEncode(buf.data(), buf.size());
 }
 
+std::string Sha256B64(const std::string &value) {
+  unsigned char sum[32];
+  unsigned int n = 0;
+  EVP_Digest(value.data(), value.size(), sum, &n, EVP_sha256(), nullptr);
+  return iya::B64URLEncode(sum, n);
+}
+
+// What a DPoP proof (RFC 9449 section 4.3) said, as the stub servers check it.
+struct ProofCheck {
+  bool ok = false;
+  std::string why;
+  std::string jkt;
+  std::string nonce;
+  std::string htu;
+};
+
+ProofCheck CheckProof(const std::string &proof, const std::string &method, const std::string &htu,
+                      const std::string &access_token) {
+  ProofCheck out;
+  std::vector<std::string> parts;
+  size_t start = 0;
+  while (start <= proof.size()) {
+    auto at = proof.find('.', start);
+    if (at == std::string::npos) {
+      parts.push_back(proof.substr(start));
+      break;
+    }
+    parts.push_back(proof.substr(start, at - start));
+    start = at + 1;
+  }
+  if (proof.empty() || parts.size() != 3) {
+    out.why = "no proof";
+    return out;
+  }
+  iya::J header;
+  iya::J claims;
+  std::vector<uint8_t> sig;
+  try {
+    auto hb = iya::B64URLDecode(parts[0], "header");
+    auto pb = iya::B64URLDecode(parts[1], "payload");
+    sig = iya::B64URLDecode(parts[2], "signature");
+    header = iya::Parse(std::string(hb.begin(), hb.end()));
+    claims = iya::Parse(std::string(pb.begin(), pb.end()));
+  } catch (const std::exception &) {
+    out.why = "not a JWS";
+    return out;
+  }
+  if (iya::Sprint(header.find("typ")) != "dpop+jwt") {
+    out.why = "typ";
+    return out;
+  }
+  if (iya::Sprint(header.find("alg")) != "ES256") {
+    out.why = "alg";
+    return out;
+  }
+  const iya::J *jwk = header.find("jwk");
+  if (!jwk || jwk->type != iya::JType::Object || jwk->has("d")) {
+    out.why = "jwk";
+    return out;
+  }
+  EVP_PKEY *key = nullptr;
+  try {
+    key = iya::PublicKeyFromJWK(*jwk);
+  } catch (const std::exception &) {
+    out.why = "jwk";
+    return out;
+  }
+  std::string input = parts[0] + "." + parts[1];
+  bool good = iya::VerifySignature(key, "ES256", reinterpret_cast<const uint8_t *>(input.data()), input.size(),
+                                   sig.data(), sig.size());
+  EVP_PKEY_free(key);
+  if (!good) {
+    out.why = "signature";
+    return out;
+  }
+  out.htu = iya::Sprint(claims.find("htu"));
+  out.nonce = iya::Sprint(claims.find("nonce"));
+  if (iya::Sprint(claims.find("htm")) != method) {
+    out.why = "htm";
+    return out;
+  }
+  if (out.htu != htu) {
+    out.why = "htu " + out.htu;
+    return out;
+  }
+  if (iya::Sprint(claims.find("jti")).empty()) {
+    out.why = "jti";
+    return out;
+  }
+  double iat = 0;
+  if (!iya::AsFloat(claims.find("iat"), iat) || iat < std::time(nullptr) - 60 || iat > std::time(nullptr) + 60) {
+    out.why = "iat";
+    return out;
+  }
+  if (!access_token.empty() && iya::Sprint(claims.find("ath")) != Sha256B64(access_token)) {
+    out.why = "ath";
+    return out;
+  }
+  if (access_token.empty() && claims.has("ath")) {
+    out.why = "ath on a token request";
+    return out;
+  }
+  // RFC 7638, written out here rather than taken from the library under test.
+  std::string members = "{\"crv\":\"" + iya::Sprint(jwk->find("crv")) + "\",\"kty\":\"" +
+                        iya::Sprint(jwk->find("kty")) + "\",\"x\":\"" + iya::Sprint(jwk->find("x")) +
+                        "\",\"y\":\"" + iya::Sprint(jwk->find("y")) + "\"}";
+  out.jkt = Sha256B64(members);
+  out.ok = true;
+  return out;
+}
+
 struct Keys {
   EVP_PKEY *main_key = nullptr;
   EVP_PKEY *other_key = nullptr;
@@ -388,6 +500,7 @@ struct Row {
   std::string nonce;
   std::string redirect;
   std::string challenge;
+  std::string jkt;
 };
 
 struct Provider {
@@ -403,6 +516,19 @@ struct Provider {
   bool has_exp = false;
   long long exp = 0;
   bool bad_at_hash = false;
+  // 0: no DPoP metadata; 1: ES256 advertised; 2: only RS256 advertised.
+  int dpop = 0;
+  bool dpop_nonce = false;
+  std::string nonce = "n-" + RandomB64(9);
+  bool require_par = false;
+  int omit = 0;
+  std::string acr;
+  std::string force_type;
+  long long iat_offset = 0;
+  int expires_in = 300;
+  iya::J algs_override;
+  std::map<std::string, std::string> notes;
+  std::map<std::string, std::string> bound;
   std::map<std::string, Row> codes;
   std::map<std::string, Row> refresh;
   std::map<std::string, std::string> access;
@@ -424,6 +550,10 @@ struct Provider {
     doc.set("subject_types_supported", subjects);
     iya::J algs = iya::J::arr();
     algs.a.push_back(iya::J::str("RS256"));
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      if (algs_override.type == iya::JType::Array) algs = algs_override;
+    }
     doc.set("id_token_signing_alg_values_supported", algs);
     iya::J methods = iya::J::arr();
     methods.a.push_back(iya::J::str("client_secret_basic"));
@@ -438,11 +568,22 @@ struct Provider {
     for (const auto &part : iya::Fields(kScopes)) scopes.a.push_back(iya::J::str(part));
     doc.set("scopes_supported", scopes);
     bool use_par = false;
+    bool required = false;
+    int dpop_mode = 0;
     {
       std::lock_guard<std::mutex> lock(mu);
       use_par = par;
+      required = require_par;
+      dpop_mode = dpop;
     }
     if (use_par) doc.set("pushed_authorization_request_endpoint", iya::J::str(server.url + "/par"));
+    if (required) doc.set("require_pushed_authorization_requests", iya::J::boolean(true));
+    if (dpop_mode) {
+      iya::J dpop_algs = iya::J::arr();
+      if (dpop_mode == 1) dpop_algs.a.push_back(iya::J::str("ES256"));
+      dpop_algs.a.push_back(iya::J::str("RS256"));
+      doc.set("dpop_signing_alg_values_supported", dpop_algs);
+    }
     return doc;
   }
 
@@ -463,6 +604,54 @@ struct Provider {
     return VerifyAssertion(form["client_assertion"], client_key, server.url);
   }
 
+  void Note(const std::string &name, const std::string &value) {
+    std::lock_guard<std::mutex> lock(mu);
+    notes[name] = value;
+  }
+
+  void Count(const std::string &name) {
+    std::lock_guard<std::mutex> lock(mu);
+    notes[name] = std::to_string(std::atoi(notes[name].c_str()) + 1);
+  }
+
+  // The DPoP proof on a request to the PAR or token endpoint. False when the stub
+  // has already answered (a bad proof, or a nonce it asks for).
+  bool AuthServerProof(int fd, const Req &req, const std::string &where, ProofCheck &check) {
+    std::string proof = req.header("DPoP");
+    if (proof.empty()) {
+      Note(where + ".proof", "none");
+      return true;
+    }
+    check = CheckProof(proof, "POST", server.url + req.path, "");
+    Note("proof.htu", check.htu);
+    if (!check.ok) {
+      Note(where + ".proof", "bad: " + check.why);
+      iya::J err = iya::J::obj();
+      err.set("error", iya::J::str("invalid_dpop_proof"));
+      err.set("error_description", iya::J::str(check.why));
+      RespondJSON(fd, 400, err);
+      return false;
+    }
+    bool want_nonce = false;
+    std::string current;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      want_nonce = dpop_nonce;
+      current = nonce;
+    }
+    if (want_nonce && check.nonce != current) {
+      Count(where + ".nonce_challenges");
+      iya::J err = iya::J::obj();
+      err.set("error", iya::J::str("use_dpop_nonce"));
+      Respond(fd, 400, iya::Stringify(err), "application/json", "DPoP-Nonce: " + current + "\r\n");
+      return false;
+    }
+    Note(where + ".proof", "valid");
+    Note(where + ".jkt", check.jkt);
+    if (!check.nonce.empty()) Note(where + ".nonce", check.nonce);
+    return true;
+  }
+
   iya::J TokenFor(const Row &row) {
     std::string access_token = RandomB64(16);
     std::string refresh_token = RandomB64(16);
@@ -471,6 +660,9 @@ struct Provider {
     long long iat = now;
     bool bad = false;
     bool flip = false;
+    int omitted = 0;
+    std::string acr_claim;
+    int lifetime = 300;
     std::string audience = kClient;
     {
       std::lock_guard<std::mutex> lock(mu);
@@ -479,12 +671,18 @@ struct Provider {
         exp_at = exp;
         iat = exp;
       }
+      iat += iat_offset;
       bad = bad_at_hash;
       flip = corrupt;
+      omitted = omit;
+      acr_claim = acr;
+      lifetime = expires_in;
       aud = kClient;
       corrupt = false;
       bad_at_hash = false;
       has_exp = false;
+      omit = 0;
+      iat_offset = 0;
     }
     std::string at_hash = bad ? "aaaa" : iya::HashClaim(access_token, "RS256");
     iya::J payload = iya::J::obj();
@@ -498,11 +696,12 @@ struct Provider {
     payload.set("name", iya::J::str("Demo User"));
     payload.set("preferred_username", iya::J::str(row.sub));
     payload.set("sid", iya::J::str(row.sid));
-    payload.set("at_hash", iya::J::str(at_hash));
+    if (!(omitted & 2)) payload.set("at_hash", iya::J::str(at_hash));
+    if (!acr_claim.empty()) payload.set("acr", iya::J::str(acr_claim));
     iya::J header = iya::J::obj();
     header.set("alg", iya::J::str("RS256"));
     header.set("kid", iya::J::str("op"));
-    header.set("typ", iya::J::str("JWT"));
+    if (!(omitted & 1)) header.set("typ", iya::J::str("JWT"));
     std::string token = SignRS256(sign_key, header, payload, flip);
     {
       std::lock_guard<std::mutex> lock(mu);
@@ -512,7 +711,7 @@ struct Provider {
     iya::J out = iya::J::obj();
     out.set("access_token", iya::J::str(access_token));
     out.set("token_type", iya::J::str("Bearer"));
-    out.set("expires_in", iya::J::integer(300));
+    out.set("expires_in", iya::J::integer(lifetime));
     out.set("refresh_token", iya::J::str(refresh_token));
     out.set("id_token", iya::J::str(token));
     out.set("scope", iya::J::str(kScopes));
@@ -535,13 +734,30 @@ struct Provider {
     if (req.path == "/userinfo") {
       std::string header = req.header("Authorization");
       std::string token = header;
-      if (Lower(token).rfind("bearer ", 0) == 0) token = token.substr(7);
+      std::string scheme;
+      if (Lower(token).rfind("bearer ", 0) == 0) {
+        scheme = "Bearer";
+        token = token.substr(7);
+      } else if (Lower(token).rfind("dpop ", 0) == 0) {
+        scheme = "DPoP";
+        token = token.substr(5);
+      }
       while (!token.empty() && token[0] == ' ') token.erase(token.begin());
+      Note("userinfo.scheme", scheme);
       std::string claims;
+      std::string jkt;
       {
         std::lock_guard<std::mutex> lock(mu);
         auto it = access.find(token);
         if (it != access.end()) claims = it->second;
+        auto bt = bound.find(token);
+        if (bt != bound.end()) jkt = bt->second;
+      }
+      if (!jkt.empty()) {
+        // A DPoP-bound token: the DPoP scheme, and a proof by the bound key with ath.
+        ProofCheck check = CheckProof(req.header("DPoP"), req.method, server.url + req.path, token);
+        Note("userinfo.proof", check.ok ? (check.jkt == jkt ? "valid" : "wrong key") : "bad: " + check.why);
+        if (scheme != "DPoP" || !check.ok || check.jkt != jkt) claims.clear();
       }
       if (claims.empty()) {
         iya::J err = iya::J::obj();
@@ -559,7 +775,10 @@ struct Provider {
         RespondJSON(fd, 401, err);
         return;
       }
+      ProofCheck check;
+      if (!AuthServerProof(fd, req, "par", check)) return;
       auto values = Form(req.body);
+      Note("par.dpop_jkt", values["dpop_jkt"]);
       std::string request_uri = "urn:par:" + RandomB64(8);
       {
         std::lock_guard<std::mutex> lock(mu);
@@ -591,7 +810,11 @@ struct Provider {
         RespondJSON(fd, 400, err);
         return;
       }
+      Note("authorize.dpop_jkt", values["dpop_jkt"]);
+      Note("authorize.acr_values", values["acr_values"]);
+      Note("authorize.pushed", stored.empty() ? "no" : "yes");
       Row row;
+      row.jkt = values["dpop_jkt"];
       row.sub = "user-1";
       row.email = "user-1@example.com";
       row.sid = "sid-1";
@@ -620,13 +843,30 @@ struct Provider {
         return;
       }
       auto params = Form(req.body);
-      if (params["grant_type"] == "client_credentials") {
+      std::string grant = params["grant_type"];
+      Count("token.calls");
+      ProofCheck check;
+      if (!AuthServerProof(fd, req, "token." + grant, check)) return;
+      // RFC 9449 section 5: a valid proof gets a DPoP-bound token, unless the test
+      // forces the token_type the stub answers.
+      auto finish = [&](iya::J doc) {
+        std::string type = check.ok ? "DPoP" : "Bearer";
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          if (!force_type.empty()) type = force_type;
+          force_type.clear();
+          if (check.ok) bound[iya::Sprint(doc.find("access_token"))] = check.jkt;
+        }
+        doc.set("token_type", iya::J::str(type));
+        RespondJSON(fd, 200, doc);
+      };
+      if (grant == "client_credentials") {
         iya::J doc = iya::J::obj();
         doc.set("access_token", iya::J::str("cc-token"));
         doc.set("token_type", iya::J::str("Bearer"));
         doc.set("expires_in", iya::J::integer(120));
         doc.set("scope", iya::J::str(params["scope"]));
-        RespondJSON(fd, 200, doc);
+        finish(doc);
         return;
       }
       if (params["grant_type"] == "refresh_token") {
@@ -660,7 +900,8 @@ struct Provider {
         header.set("kid", iya::J::str("op"));
         header.set("typ", iya::J::str("JWT"));
         minted.set("id_token", iya::J::str(SignRS256(sign_key, header, body, false)));
-        RespondJSON(fd, 200, minted);
+        Count("token.refresh_token.issued");
+        finish(minted);
         return;
       }
       std::string code = params["code"];
@@ -673,6 +914,14 @@ struct Provider {
           row = it->second;
           found = true;
         }
+      }
+      if (found && !row.jkt.empty() && row.jkt != check.jkt) {
+        // RFC 9449 section 10: the code is bound to the dpop_jkt of the authorization request.
+        iya::J err = iya::J::obj();
+        err.set("error", iya::J::str("invalid_dpop_proof"));
+        err.set("error_description", iya::J::str("the proof key is not the dpop_jkt key"));
+        RespondJSON(fd, 400, err);
+        return;
       }
       if (!found || params["redirect_uri"] != row.redirect ||
           iya::CodeChallengeS256(params["code_verifier"]) != row.challenge) {
@@ -687,7 +936,7 @@ struct Provider {
         std::lock_guard<std::mutex> lock(mu);
         codes.erase(code);
       }
-      RespondJSON(fd, 200, TokenFor(row));
+      finish(TokenFor(row));
       return;
     }
     iya::J err = iya::J::obj();
@@ -708,6 +957,11 @@ struct Transmitter {
   std::string verify_state;
   int verify_status = 0;
   std::string hold;
+  bool dpop_nonce = false;
+  std::string nonce = "tx-" + RandomB64(9);
+  int proofs = 0;
+  int challenges = 0;
+  std::string proof_why;
 
   std::string PollBody() {
     iya::J sets = iya::J::obj();
@@ -728,7 +982,38 @@ struct Transmitter {
       std::lock_guard<std::mutex> lock(mu);
       authorization = auth;
     }
-    if (auth != "Bearer app-token" && req.path != "/.well-known/ssf-configuration" && req.path.rfind("/jwks", 0) != 0) {
+    bool dpop_ok = false;
+    if (auth.rfind("DPoP ", 0) == 0) {
+      // The provider's client-credentials token, DPoP-bound: a proof with ath, and the
+      // transmitter's nonce when it asks for one.
+      std::string token = auth.substr(5);
+      ProofCheck check = CheckProof(req.header("DPoP"), req.method, server.url + req.path, token);
+      bool want = false;
+      std::string current;
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        want = dpop_nonce;
+        current = nonce;
+        proof_why = check.ok ? "valid" : check.why;
+      }
+      if (check.ok && want && check.nonce != current) {
+        {
+          std::lock_guard<std::mutex> lock(mu);
+          challenges++;
+        }
+        Respond(fd, 401, "", "",
+                "WWW-Authenticate: DPoP error=\"use_dpop_nonce\", error_description=\"nonce\"\r\nDPoP-Nonce: " +
+                    current + "\r\n");
+        return;
+      }
+      if (check.ok && token == "cc-token") {
+        dpop_ok = true;
+        std::lock_guard<std::mutex> lock(mu);
+        proofs++;
+      }
+    }
+    if (auth != "Bearer app-token" && !dpop_ok && req.path != "/.well-known/ssf-configuration" &&
+        req.path.rfind("/jwks", 0) != 0) {
       iya::J err = iya::J::obj();
       err.set("error", iya::J::str("invalid_token"));
       RespondJSON(fd, 401, err);
@@ -943,6 +1228,79 @@ void iya_test_provider_set_bad_at_hash(iya_test_provider *provider, int on) {
   p->bad_at_hash = on != 0;
 }
 
+void iya_test_provider_set_dpop(iya_test_provider *provider, int mode) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->dpop = mode;
+}
+
+void iya_test_provider_set_dpop_nonce(iya_test_provider *provider, int on) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->dpop_nonce = on != 0;
+}
+
+void iya_test_provider_set_require_par(iya_test_provider *provider, int on) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->require_par = on != 0;
+}
+
+void iya_test_provider_set_omit(iya_test_provider *provider, int what) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->omit = what;
+}
+
+void iya_test_provider_set_acr(iya_test_provider *provider, const char *acr) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->acr = acr ? acr : "";
+}
+
+void iya_test_provider_set_token_type(iya_test_provider *provider, const char *type) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->force_type = type ? type : "";
+}
+
+void iya_test_provider_set_iat_offset(iya_test_provider *provider, long long offset) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->iat_offset = offset;
+}
+
+void iya_test_provider_set_expires_in(iya_test_provider *provider, int seconds) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->expires_in = seconds;
+}
+
+void iya_test_provider_set_algs(iya_test_provider *provider, const char *json_array) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->algs_override = json_array && json_array[0] ? iya::Parse(json_array) : iya::J();
+}
+
+void iya_test_provider_revoke_refresh(iya_test_provider *provider) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  p->refresh.clear();
+}
+
+const char *iya_test_provider_note(iya_test_provider *provider, const char *name) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  std::lock_guard<std::mutex> lock(p->mu);
+  auto it = p->notes.find(name ? name : "");
+  p->notes["__hold"] = it == p->notes.end() ? "" : it->second;
+  return p->notes["__hold"].c_str();
+}
+
+char *iya_test_provider_metadata(iya_test_provider *provider) {
+  auto *p = reinterpret_cast<Provider *>(provider);
+  return DupC(iya::Stringify(p->Metadata()));
+}
+
 int iya_test_manual(const char *url, int *status, char *location, size_t location_len) {
   try {
     iya::HttpResult res = iya::Send(url ? url : "", "GET", {}, nullptr, "", "protocol");
@@ -1027,6 +1385,24 @@ char *iya_test_tx_deliver(iya_test_tx *tx, const char *event_type, const char *s
     t->order.emplace_back(jti);
   }
   return DupC(jti);
+}
+
+void iya_test_tx_set_dpop_nonce(iya_test_tx *tx, int on) {
+  auto *t = reinterpret_cast<Transmitter *>(tx);
+  std::lock_guard<std::mutex> lock(t->mu);
+  t->dpop_nonce = on != 0;
+}
+
+int iya_test_tx_dpop_proofs(iya_test_tx *tx) {
+  auto *t = reinterpret_cast<Transmitter *>(tx);
+  std::lock_guard<std::mutex> lock(t->mu);
+  return t->proofs;
+}
+
+int iya_test_tx_dpop_challenges(iya_test_tx *tx) {
+  auto *t = reinterpret_cast<Transmitter *>(tx);
+  std::lock_guard<std::mutex> lock(t->mu);
+  return t->challenges;
 }
 
 int iya_test_tx_ack_count(iya_test_tx *tx) {
