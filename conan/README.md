@@ -15,6 +15,6 @@ layout: copy this directory to `recipes/iya-oidc-caep-risc/` there.
 To check it locally (Conan 2, a C++17 profile):
 
 ```sh
-conan create conan/all --version 0.2.0 --build=missing
-conan create conan/all --version 0.2.0 --build=missing -o "&:shared=True"
+conan create conan/all --version 0.2.1 --build=missing
+conan create conan/all --version 0.2.1 --build=missing -o "&:shared=True"
 ```

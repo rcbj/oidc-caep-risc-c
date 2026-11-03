@@ -1,4 +1,7 @@
 sources:
+  "0.2.1":
+    url: "https://github.com/rcbj/oidc-caep-risc-c/archive/refs/tags/v0.2.1.tar.gz"
+    sha256: "196bfc23b09ea43ba1279ce402e5e42bd0c6949cd0c9de893928c576aba40187"
   "0.2.0":
     url: "https://github.com/rcbj/oidc-caep-risc-c/archive/refs/tags/v0.2.0.tar.gz"
     sha256: "a45a70a592c98a41dbe2c6e066eb4c49b34c7b1c3a7b6b9e77255fda6af9dd88"
